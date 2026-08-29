@@ -33,6 +33,7 @@ pub mod playbook;
 pub mod pqc;
 pub mod rag_agent;
 pub mod rag_poison_guard;
+pub mod sandbox;
 pub mod self_healing;
 mod yara_engine;
 pub mod zk_proof;
@@ -688,25 +689,21 @@ async fn red_team_simulate_handler() -> Json<RedTeamSimulateResponse> {
         let start = std::time::Instant::now();
         attack_vectors_tested.push(test.name.clone());
 
-        // Truly execute the payload locally to see if eBPF or the system intercepts it
+        // Truly execute the payload safely inside the Docker Detonation Sandbox
         let cmd = test.payload["cmd"].as_str().unwrap_or("echo");
-        let result = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(cmd)
-            .output();
+        
+        // The host eBPF tracepoint will still catch the execve syscall made by Docker
+        // but the process execution itself is isolated from the host OS
+        let result = sandbox::DetonationSandbox::detonate_payload(cmd);
 
         let latency_ms = start.elapsed().as_millis() as u64;
 
-        // In a true eBPF setup, the command would be blocked (e.g. exit code 1 or killed by signal)
+        // In a true eBPF setup, the command would be blocked natively.
+        // If the sandbox returns an error (meaning the command failed or was killed by eBPF), it's a pass.
         let (passed, action_received) = match result {
-            Ok(output) => {
-                if !output.status.success() {
-                    blocked_count += 1;
-                    (true, "blocked".to_string())
-                } else {
-                    // Command succeeded, defense failed
-                    (false, "allowed".to_string())
-                }
+            Ok(_) => {
+                // Command succeeded, defense failed
+                (false, "allowed".to_string())
             }
             Err(_) => {
                 blocked_count += 1;
