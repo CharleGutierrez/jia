@@ -1,0 +1,24 @@
+version: '3.8'
+
+services:
+  jia-engine:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: jia_cyber_defense
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    environment:
+      - RUST_LOG=info
+      - JIA_PORT=9090
+      - BIND_ADDR=0.0.0.0
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9090/api/v1/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+networks:
+  default:
+    name: jia_network

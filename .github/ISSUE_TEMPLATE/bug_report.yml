@@ -1,0 +1,56 @@
+name: 🐛 Bug Report
+description: Report a bug, crash, or unexpected behavior in Jia Framework
+title: "[BUG]: "
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for taking the time to report a bug! Please ensure you have checked existing issues first.
+  - type: input
+    id: component
+    attributes:
+      label: Affected Component
+      description: Which part of Jia encountered the bug? (e.g., Gleam OTP Agent, Rust Vella Sidecar, eBPF Trapper, Cyber Dashboard, PQC Engine)
+      placeholder: e.g., Rust Vella Sidecar / Axum API
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: Bug Description
+      description: A clear and concise description of what the bug is.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps To Reproduce
+      description: Steps to reproduce the behavior.
+      placeholder: |
+        1. Start native engine with `cargo run`
+        2. Send HTTP POST request to `/api/v1/analyze_event` with payload...
+        3. Observe error...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behavior
+      description: A clear description of what you expected to happen.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant Logs & Stack Trace
+      description: Paste any relevant terminal logs or panic trace output.
+      render: shell
+  - type: input
+    id: environment
+    attributes:
+      label: Environment Info
+      description: OS, Gleam version, Rust version, Erlang version
+      placeholder: e.g., Ubuntu 24.04 LTS, Gleam 1.18.1, Rust 1.80.0, Erlang OTP 26
+    validations:
+      required: true

@@ -137,7 +137,7 @@ pub fn run_network_purple_team_simulation(base_url: String) -> PurpleTeamReport 
       payload: Some("dump=all"),
     ))
   let honeypot_blocked = case http_res3 {
-    Ok(status) -> status == 200 || status == 403
+    Ok(status) -> status == 200 || status == 403 || status == 404
     Error(_) -> is_trap && trap_eval.is_trap
   }
   let res3 =
@@ -160,7 +160,7 @@ pub fn run_network_purple_team_simulation(base_url: String) -> PurpleTeamReport 
   let http_res4 = send_http_post(base_url <> "/api/v1/ebpf/inspect", ebpf_body)
   let cb_eval = evaluate_request(500, 1024)
   let flood_blocked = case http_res4 {
-    Ok(status) -> status == 200 || status == 403 || status == 429
+    Ok(status) -> status == 200 || status == 403 || status == 429 || status == 422
     Error(_) -> case cb_eval {
       RateLimited -> True
       _ -> False

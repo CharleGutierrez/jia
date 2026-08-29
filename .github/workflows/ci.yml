@@ -1,0 +1,57 @@
+name: CI & Security Audit
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+    branches:
+      - main
+      - master
+
+jobs:
+  gleam-test:
+    name: Gleam OTP Tests & Formatting
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: "26.2"
+          gleam-version: "1.18.1"
+          rebar3-version: "3"
+
+      - name: Download Gleam Dependencies
+        run: gleam deps download
+
+      - name: Check Gleam Formatting
+        run: gleam format --check src test
+
+      - name: Run Gleam Tests
+        run: gleam test
+
+  rust-test:
+    name: Rust Vella Engine Tests & Linting
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "native -> target"
+
+      - name: Check Rust Formatting
+        run: cd native && cargo fmt --check
+
+      - name: Run Cargo Clippy
+        run: cd native && cargo clippy -- -D warnings
+
+      - name: Run Rust Unit & Property Tests
+        run: cd native && cargo test

@@ -1,0 +1,32 @@
+# Jia (家) Framework - AI Cyber Defense & Security Sidecar
+
+> Jia (家) is an open-source, high-performance AI-Native Cyber Defense System combining the Erlang/BEAM OTP actor model (via Gleam) with a high-throughput Rust SecOps engine (Vella). It provides real-time AI prompt injection protection, eBPF kernel syscall inspection, post-quantum cryptography (ML-KEM/ML-DSA), MITRE ATT&CK vector RAG search, and immutable WORM audit logs.
+
+## Core Capabilities
+- **Erlang/BEAM OTP Supervision**: Lightweight Gleam actor processes isolate security event streams. Faults automatically self-heal without system downtime.
+- **AI Prompt & PII Guardrails**: Filters prompt injection attacks (DAN mode, system prompt overrides) and scrubs PII (SSN, API keys) in real time.
+- **eBPF Kernel Syscall Trapper**: Low-level kernel monitoring (`execve`, `ptrace`, `bpf_cmd`) to intercept rootkits and unauthorized memory inspection.
+- **Post-Quantum Cryptography Engine**: NIST ML-KEM-768 key encapsulation and ML-DSA-65 signatures over WORM audit logs using SHAKE-256 KMAC.
+- **MITRE ATT&CK & CVE RAG Search**: Vector search against Log4Shell, SQLi, ProxyLogon, and Spring4Shell signatures.
+- **Dynamic Rhai Security Playbooks**: Real-time evaluation of declarative `.rhai` playbooks for instant SOAR response.
+- **Glassmorphic Command Dashboard**: Embedded HTML5/CSS3 real-time dashboard served at `http://127.0.0.1:9090/dashboard`.
+
+## Quick Links
+- Repository: https://github.com/CharleGutierrez/jia
+- Full Documentation: https://github.com/CharleGutierrez/jia/tree/main/docs
+- Architecture Guide: https://github.com/CharleGutierrez/jia/blob/main/docs/ARCHITECTURE.md
+- Benchmarks: https://github.com/CharleGutierrez/jia/blob/main/docs/BENCHMARKS.md
+- Security Playbooks: https://github.com/CharleGutierrez/jia/blob/main/docs/SECURITY_PLAYBOOKS.md
+
+## Installation & Usage
+```bash
+# 1-Line Execution
+./start_jia.sh
+
+# Docker Compose
+docker compose up -d
+
+# Manual Gleam + Rust Execution
+gleam test && gleam run
+cd native && cargo run --release
+```
