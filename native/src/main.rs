@@ -88,6 +88,7 @@ pub struct AppState {
     pub worm_logs: Arc<Mutex<Vec<WormAuditEntry>>>,
     pub tx: broadcast::Sender<TelemetryEvent>,
     pub yara_scanner: Arc<yara_engine::YaraScanner>,
+    pub db_pool: sqlx::SqlitePool,
 }
 
 fn calculate_entropy(data: &str) -> f64 {
@@ -159,12 +160,37 @@ async fn main() {
     let (tx, _) = broadcast::channel::<TelemetryEvent>(100);
     let yara_scanner = Arc::new(yara_engine::YaraScanner::new().expect("Failed to initialize YARA Rule Engine"));
     
+    // Initialize persistent SQLite database for WebAuthn credentials
+    let db_pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(5)
+        .connect("sqlite::memory:") // In production this would be sqlite:jia_secops.db
+        .await
+        .expect("Failed to create SQLite connection pool");
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS users (
+            id TEXT PRIMARY KEY,
+            username TEXT NOT NULL,
+            public_key_cbor_hex TEXT NOT NULL
+        );"
+    ).execute(&db_pool).await.unwrap();
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS challenges (
+            challenge_id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            challenge_base64 TEXT NOT NULL,
+            expires_at BIGINT NOT NULL
+        );"
+    ).execute(&db_pool).await.unwrap();
+
     let state = AppState {
         cyber_command: Arc::new(CyberCommand::new("ASN-JIA-DEFENSE")),
         start_time: Instant::now(),
         worm_logs: Arc::new(Mutex::new(Vec::new())),
         tx,
         yara_scanner,
+        db_pool,
     };
 
     let cors = CorsLayer::new()

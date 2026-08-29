@@ -180,24 +180,16 @@ pub fn constant_time_compare(a: &[u8], b: &[u8]) -> bool {
 
 #[derive(Clone, Debug)]
 pub struct WebAuthnEngine {
-    active_challenges: Arc<Mutex<HashMap<String, ChallengeResponse>>>,
-}
-
-impl Default for WebAuthnEngine {
-    fn default() -> Self {
-        Self::new()
-    }
+    db_pool: sqlx::SqlitePool,
 }
 
 impl WebAuthnEngine {
-    pub fn new() -> Self {
-        Self {
-            active_challenges: Arc::new(Mutex::new(HashMap::new())),
-        }
+    pub fn new(db_pool: sqlx::SqlitePool) -> Self {
+        Self { db_pool }
     }
 
     /// Generates W3C PublicKeyCredentialCreationOptions & RequestOptions
-    pub fn generate_challenge(&self, user_id: &str, rp_id: &str) -> ChallengeResponse {
+    pub async fn generate_challenge(&self, user_id: &str, rp_id: &str) -> Result<ChallengeResponse, String> {
         let challenge_id = Uuid::new_v4().to_string();
         let mut hasher = Sha256::new();
         let nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
@@ -239,7 +231,7 @@ impl WebAuthnEngine {
 
         let resp = ChallengeResponse {
             challenge_id: challenge_id.clone(),
-            challenge,
+            challenge: challenge.clone(),
             user_id: user_id.to_string(),
             rp_id: rp_id.to_string(),
             timeout_ms: 60000,
@@ -248,11 +240,16 @@ impl WebAuthnEngine {
             request_options,
         };
 
-        self.active_challenges
-            .lock()
-            .unwrap()
-            .insert(challenge_id, resp.clone());
-        resp
+        sqlx::query("INSERT INTO challenges (challenge_id, user_id, challenge_base64, expires_at) VALUES (?, ?, ?, ?)")
+            .bind(&challenge_id)
+            .bind(user_id)
+            .bind(&challenge)
+            .bind(chrono::Utc::now().timestamp() + 60)
+            .execute(&self.db_pool)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        Ok(resp)
     }
 
     /// Parse raw WebAuthn authenticatorData structure (37+ bytes)
@@ -280,12 +277,15 @@ impl WebAuthnEngine {
     }
 
     /// Verify WebAuthn / FIDO2 Cryptographic Assertion & ClientDataJSON
-    pub fn verify_response(&self, req: &VerifyChallengeRequest) -> VerifyChallengeResponse {
-        let mut challenges = self.active_challenges.lock().unwrap();
+    pub async fn verify_response(&self, req: &VerifyChallengeRequest) -> VerifyChallengeResponse {
+        // 1. Fetch challenge from SQLite
+        let challenge_record = sqlx::query!("SELECT user_id, challenge_base64 FROM challenges WHERE challenge_id = ?", req.challenge_id)
+            .fetch_optional(&self.db_pool)
+            .await;
 
-        let stored = match challenges.remove(&req.challenge_id) {
-            Some(c) => c,
-            None => {
+        let (stored_user_id, stored_challenge) = match challenge_record {
+            Ok(Some(record)) => (record.user_id, record.challenge_base64),
+            _ => {
                 return VerifyChallengeResponse {
                     verified: false,
                     user_id: req.user_id.clone(),
@@ -296,7 +296,11 @@ impl WebAuthnEngine {
             }
         };
 
-        if stored.user_id != req.user_id {
+        // 2. Delete the challenge (one-time use)
+        let _ = sqlx::query!("DELETE FROM challenges WHERE challenge_id = ?", req.challenge_id)
+            .execute(&self.db_pool).await;
+
+        if stored_user_id != req.user_id {
             return VerifyChallengeResponse {
                 verified: false,
                 user_id: req.user_id.clone(),
@@ -315,10 +319,10 @@ impl WebAuthnEngine {
 
         // 2. Check challenge nonce in constant-time
         let nonce_matches = if let Some(ref client_data) = parsed_client_data {
-            constant_time_compare(client_data.challenge.as_bytes(), stored.challenge.as_bytes())
+            constant_time_compare(client_data.challenge.as_bytes(), stored_challenge.as_bytes())
         } else {
             req.client_data_json.contains(&req.challenge)
-                || constant_time_compare(req.challenge.as_bytes(), stored.challenge.as_bytes())
+                || constant_time_compare(req.challenge.as_bytes(), stored_challenge.as_bytes())
         };
 
         if !nonce_matches {
@@ -345,6 +349,9 @@ impl WebAuthnEngine {
         }
 
         // 4. Parse authenticatorData and check User Presence (UP) & User Verification (UV) flags
+        let auth_bytes = decode_base64url(&req.authenticator_data)
+            .unwrap_or_else(|_| req.authenticator_data.as_bytes().to_vec());
+            
         let auth_data = match Self::parse_authenticator_data(&auth_bytes) {
             Ok(data) => data,
             Err(e) => {
@@ -368,68 +375,85 @@ impl WebAuthnEngine {
             };
         }
 
-        // 5. WebAuthn Cryptographic Verification
-        if let Some(pub_key_hex) = &req.user_public_key_hex {
-            let mut hasher = Sha256::new();
-            hasher.update(&client_bytes);
-            let client_data_hash = hasher.finalize();
+        // 5. WebAuthn Cryptographic Verification using database key
+        // Fetch user public key from DB
+        let user_record = sqlx::query!("SELECT public_key_cbor_hex FROM users WHERE id = ?", req.user_id)
+            .fetch_optional(&self.db_pool)
+            .await
+            .unwrap_or(None);
 
-            let mut message = Vec::new();
-            message.extend_from_slice(&auth_bytes);
-            message.extend_from_slice(&client_data_hash);
+        let pub_key_hex = match user_record {
+            Some(record) => record.public_key_cbor_hex,
+            None => {
+                // Trust On First Use (TOFU) - Auto-register new users
+                if let Some(ref pk) = req.user_public_key_hex {
+                    let _ = sqlx::query!("INSERT INTO users (id, username, public_key_cbor_hex) VALUES (?, ?, ?)", 
+                        req.user_id, req.user_id, pk)
+                        .execute(&self.db_pool).await;
+                    pk.clone()
+                } else {
+                    return VerifyChallengeResponse {
+                        verified: false,
+                        user_id: req.user_id.clone(),
+                        challenge_id: req.challenge_id.clone(),
+                        message: "User not found and no public key provided for TOFU registration.".into(),
+                        session_token: None,
+                    };
+                }
+            }
+        };
 
-            let cbor_bytes = hex::decode(pub_key_hex).unwrap_or_default();
-            let cose_key: Result<Value, _> = ciborium::from_reader(cbor_bytes.as_slice());
-            
-            let mut valid_signature = false;
-            if let Ok(Value::Map(map)) = cose_key {
-                let mut x_bytes = None;
-                let mut y_bytes = None;
-                for (k, v) in map {
-                    if let Value::Integer(key_int) = k {
-                        let k_val: i128 = key_int.into();
-                        if k_val == -2 {
-                            if let Value::Bytes(b) = v { x_bytes = Some(b); }
-                        } else if k_val == -3 {
-                            if let Value::Bytes(b) = v { y_bytes = Some(b); }
-                        }
+        let mut hasher = Sha256::new();
+        hasher.update(&client_bytes);
+        let client_data_hash = hasher.finalize();
+
+        let mut message = Vec::new();
+        message.extend_from_slice(&auth_bytes);
+        message.extend_from_slice(&client_data_hash);
+
+        let cbor_bytes = hex::decode(&pub_key_hex).unwrap_or_default();
+        let cose_key: Result<Value, _> = ciborium::from_reader(cbor_bytes.as_slice());
+        
+        let mut valid_signature = false;
+        if let Ok(Value::Map(map)) = cose_key {
+            let mut x_bytes = None;
+            let mut y_bytes = None;
+            for (k, v) in map {
+                if let Value::Integer(key_int) = k {
+                    let k_val: i128 = key_int.into();
+                    if k_val == -2 {
+                        if let Value::Bytes(b) = v { x_bytes = Some(b); }
+                    } else if k_val == -3 {
+                        if let Value::Bytes(b) = v { y_bytes = Some(b); }
                     }
                 }
+            }
+            
+            if let (Some(x), Some(y)) = (x_bytes, y_bytes) {
+                let mut uncompressed = Vec::with_capacity(1 + x.len() + y.len());
+                uncompressed.push(0x04);
+                uncompressed.extend_from_slice(&x);
+                uncompressed.extend_from_slice(&y);
                 
-                if let (Some(x), Some(y)) = (x_bytes, y_bytes) {
-                    let mut uncompressed = Vec::with_capacity(1 + x.len() + y.len());
-                    uncompressed.push(0x04);
-                    uncompressed.extend_from_slice(&x);
-                    uncompressed.extend_from_slice(&y);
-                    
-                    if let Ok(encoded_point) = EncodedPoint::from_bytes(&uncompressed) {
-                        if let Ok(verifying_key) = VerifyingKey::from_encoded_point(&encoded_point) {
-                            let sig_bytes = decode_base64url(&req.signature).unwrap_or_else(|_| req.signature.as_bytes().to_vec());
-                            if let Ok(signature) = Signature::from_der(&sig_bytes) {
-                                if verifying_key.verify(&message, &signature).is_ok() {
-                                    valid_signature = true;
-                                }
+                if let Ok(encoded_point) = EncodedPoint::from_bytes(&uncompressed) {
+                    if let Ok(verifying_key) = VerifyingKey::from_encoded_point(&encoded_point) {
+                        let sig_bytes = decode_base64url(&req.signature).unwrap_or_else(|_| req.signature.as_bytes().to_vec());
+                        if let Ok(signature) = Signature::from_der(&sig_bytes) {
+                            if verifying_key.verify(&message, &signature).is_ok() {
+                                valid_signature = true;
                             }
                         }
                     }
                 }
             }
+        }
 
-            if !valid_signature {
-                return VerifyChallengeResponse {
-                    verified: false,
-                    user_id: req.user_id.clone(),
-                    challenge_id: req.challenge_id.clone(),
-                    message: "Cryptographic signature verification failed.".into(),
-                    session_token: None,
-                };
-            }
-        } else {
+        if !valid_signature {
             return VerifyChallengeResponse {
                 verified: false,
                 user_id: req.user_id.clone(),
                 challenge_id: req.challenge_id.clone(),
-                message: "Missing public key for signature verification.".into(),
+                message: "Cryptographic signature verification failed.".into(),
                 session_token: None,
             };
         }
@@ -449,21 +473,44 @@ impl WebAuthnEngine {
 }
 
 pub async fn webauthn_challenge_handler(
-    State(_state): State<crate::AppState>,
+    State(state): State<crate::AppState>,
     Json(req): Json<ChallengeRequest>,
 ) -> impl IntoResponse {
-    let engine = WebAuthnEngine::new();
+    let engine = WebAuthnEngine::new(state.db_pool.clone());
     let rp_id = req.rp_id.unwrap_or_else(|| "jia.security".into());
-    let resp = engine.generate_challenge(&req.user_id, &rp_id);
-    (StatusCode::OK, Json(resp))
+    match engine.generate_challenge(&req.user_id, &rp_id).await {
+        Ok(resp) => (StatusCode::OK, Json(resp)),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, Json(ChallengeResponse {
+            challenge_id: "".into(),
+            challenge: "".into(),
+            user_id: "".into(),
+            rp_id: "".into(),
+            timeout_ms: 0,
+            timestamp: "".into(),
+            creation_options: PublicKeyCredentialCreationOptions {
+                rp: PublicKeyCredentialRpEntity { name: "".into(), id: "".into() },
+                user: PublicKeyCredentialUserEntity { id: "".into(), name: "".into(), display_name: "".into() },
+                challenge: "".into(),
+                pub_key_cred_params: vec![],
+                timeout: 0,
+                attestation: "".into(),
+            },
+            request_options: PublicKeyCredentialRequestOptions {
+                challenge: "".into(),
+                timeout: 0,
+                rp_id: "".into(),
+                user_verification: "".into(),
+            },
+        }))
+    }
 }
 
 pub async fn webauthn_verify_handler(
-    State(_state): State<crate::AppState>,
+    State(state): State<crate::AppState>,
     Json(req): Json<VerifyChallengeRequest>,
 ) -> impl IntoResponse {
-    let engine = WebAuthnEngine::new();
-    let resp = engine.verify_response(&req);
+    let engine = WebAuthnEngine::new(state.db_pool.clone());
+    let resp = engine.verify_response(&req).await;
     let status = if resp.verified {
         StatusCode::OK
     } else {
