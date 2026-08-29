@@ -33,13 +33,12 @@ impl EbpfTrapper {
     /// Initialize the true eBPF Kernel Trapper using Aya.
     /// This loads the compiled BPF bytecode (jia-ebpf) into the kernel.
     pub fn init() -> Result<Self, String> {
-        // In a production environment, the eBPF object file is compiled separately
-        // using `cargo-bpf` or `xtask` and embedded here.
-        // #[cfg(not(debug_assertions))]
-        // let bpf_data = include_bytes_aligned!("../../jia-ebpf/target/bpfel-unknown-none/release/jia-ebpf");
-        
-        // For architectural demonstration, we load a placeholder or fallback to mock if no root
-        let bpf_data = &[]; // Placeholder for actual compiled BPF bytes
+        // Load the actual compiled eBPF object file.
+        // This requires `cargo build -p jia-ebpf --target bpfel-unknown-none --release`
+        #[cfg(not(debug_assertions))]
+        let bpf_data = include_bytes_aligned!("../../jia-ebpf/target/bpfel-unknown-none/release/jia-ebpf");
+        #[cfg(debug_assertions)]
+        let bpf_data = include_bytes_aligned!("../../jia-ebpf/target/bpfel-unknown-none/release/jia-ebpf"); // Or debug path
         
         let mut bpf = Ebpf::load(bpf_data).map_err(|e| format!("Failed to load eBPF bytecode: {}", e))?;
         
