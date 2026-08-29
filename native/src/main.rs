@@ -34,6 +34,7 @@ pub mod pqc;
 pub mod rag_agent;
 pub mod rag_poison_guard;
 pub mod self_healing;
+mod yara_engine;
 pub mod zk_proof;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -85,6 +86,7 @@ pub struct AppState {
     pub start_time: Instant,
     pub worm_logs: Arc<Mutex<Vec<WormAuditEntry>>>,
     pub tx: broadcast::Sender<TelemetryEvent>,
+    pub yara_scanner: Arc<yara_engine::YaraScanner>,
 }
 
 fn calculate_entropy(data: &str) -> f64 {
@@ -154,11 +156,14 @@ async fn main() {
     info!("🚀 Initializing Jia Native Sidecar (Vella AI & Defense Engine)...");
 
     let (tx, _) = broadcast::channel::<TelemetryEvent>(100);
+    let yara_scanner = Arc::new(yara_engine::YaraScanner::new().expect("Failed to initialize YARA Rule Engine"));
+    
     let state = AppState {
         cyber_command: Arc::new(CyberCommand::new("ASN-JIA-DEFENSE")),
         start_time: Instant::now(),
         worm_logs: Arc::new(Mutex::new(Vec::new())),
         tx,
+        yara_scanner,
     };
 
     let cors = CorsLayer::new()
@@ -218,6 +223,30 @@ async fn analyze_event_handler(
 
     let prompt_str = req.prompt.as_deref().unwrap_or("");
     let payload_str = req.payload.as_deref().unwrap_or("");
+    
+    // Check if the payload is actually the prompt
+    let combined_text = if payload_str == "normal request" && !prompt_str.is_empty() {
+        prompt_str
+    } else {
+        if prompt_str.is_empty() { payload_str } else { prompt_str }
+    };
+
+    // 0. Static Malware Signature Scan via YARA
+    if let Some(yara_match) = state.yara_scanner.scan_payload(combined_text) {
+        return Json(AnalyzeEventResponse {
+            event_id,
+            timestamp,
+            risk_level: "Critical".to_string(),
+            confidence_score: 0.99,
+            prompt_injection_detected: false,
+            zero_day_detected: true,
+            zero_day_details: Some(yara_match),
+            action: "block".to_string(),
+            recommendation: "Quarantine immediately".to_string(),
+            reasoning: vec!["YARA signature match".to_string()],
+        });
+    }
+
     let full_text = format!("{} {}", prompt_str, payload_str).to_lowercase();
 
     // 1. Detect Prompt Injection Attempts
