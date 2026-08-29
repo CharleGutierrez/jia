@@ -58,6 +58,7 @@ libc = "0.2"
 # ── Real Post-Quantum Cryptography (NIST FIPS 203 / 204) ────────────────────
 ml-kem = { version = "0.2", features = ["std"] }
 ml-dsa = { version = "0.1", features = ["getrandom", "pkcs8"] }
+aes-gcm = "0.10.3"
 
 # ── Real WebAuthn ECDSA Signature Verification ─────────────────────────────
 p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }

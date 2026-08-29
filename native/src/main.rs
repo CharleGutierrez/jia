@@ -481,7 +481,48 @@ async fn ws_telemetry_handler(
 
 async fn handle_socket(mut socket: WebSocket, state: AppState) {
     let mut rx = state.tx.subscribe();
-    info!("New WebSocket subscriber connected to /ws/telemetry");
+    info!("New WebSocket subscriber connected to /ws/telemetry. Waiting for PQC Handshake...");
+
+    // 1. Wait for client to send ML-KEM-768 Public Key
+    let mut shared_secret_bytes = [0u8; 32];
+    let mut is_encrypted = false;
+    
+    if let Some(Ok(Message::Text(msg))) = socket.recv().await {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&msg) {
+            if json["type"] == "PQC_HANDSHAKE" {
+                if let Some(pk_hex) = json["public_key"].as_str() {
+                    // Generate ciphertext and shared secret using actual ML-KEM
+                    let encapsulation = pqc::PqcEngine::kyber768_encapsulate(pk_hex);
+                    
+                    // Decode shared secret hex into exactly 32 bytes for AES-256
+                    if let Ok(ss) = hex::decode(&encapsulation.shared_secret_hex) {
+                        if ss.len() == 32 {
+                            shared_secret_bytes.copy_from_slice(&ss);
+                            is_encrypted = true;
+
+                            // Send the ciphertext back to the client so they can decapsulate
+                            let response = serde_json::json!({
+                                "type": "PQC_HANDSHAKE_RESPONSE",
+                                "ciphertext": encapsulation.ciphertext_hex
+                            });
+                            let _ = socket.send(Message::Text(serde_json::to_string(&response).unwrap())).await;
+                            info!("PQC ML-KEM-768 Handshake complete. Tunnel encrypted via AES-256-GCM.");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if !is_encrypted {
+        info!("No PQC Handshake received. Closing connection to enforce Zero-Trust.");
+        let _ = socket.close().await;
+        return;
+    }
+
+    // Initialize AES-GCM with the ML-KEM shared secret
+    use aes_gcm::{aead::{Aead, AeadCore, KeyInit, OsRng}, Aes256Gcm, Nonce, Key};
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&shared_secret_bytes));
 
     let welcome = TelemetryEvent {
         event_id: Uuid::new_v4().to_string(),
@@ -490,11 +531,17 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
         source_ip: "127.0.0.1".into(),
         risk_level: "LOW_RISK".into(),
         action: "NONE".into(),
-        details: "Connected to Jia Native Threat Telemetry Stream".into(),
+        details: "Connected to Jia Native Threat Telemetry Stream (Post-Quantum Encrypted)".into(),
     };
 
     if let Ok(msg_text) = serde_json::to_string(&welcome) {
-        let _ = socket.send(Message::Text(msg_text)).await;
+        let nonce = Aes256Gcm::generate_nonce(&mut OsRng); // 96-bits; unique per message
+        let ciphertext = cipher.encrypt(&nonce, msg_text.as_bytes()).unwrap_or_default();
+        let payload = serde_json::json!({
+            "nonce": hex::encode(nonce),
+            "ciphertext": hex::encode(ciphertext)
+        });
+        let _ = socket.send(Message::Text(serde_json::to_string(&payload).unwrap())).await;
     }
 
     loop {
@@ -503,7 +550,14 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                 match result {
                     Ok(event) => {
                         if let Ok(msg_text) = serde_json::to_string(&event) {
-                            if socket.send(Message::Text(msg_text)).await.is_err() {
+                            let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+                            let ciphertext = cipher.encrypt(&nonce, msg_text.as_bytes()).unwrap_or_default();
+                            let payload = serde_json::json!({
+                                "nonce": hex::encode(nonce),
+                                "ciphertext": hex::encode(ciphertext)
+                            });
+                            
+                            if socket.send(Message::Text(serde_json::to_string(&payload).unwrap())).await.is_err() {
                                 break;
                             }
                         }
