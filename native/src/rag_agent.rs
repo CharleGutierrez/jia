@@ -106,18 +106,19 @@ impl RagEngine {
         Self { cves }
     }
 
-    pub fn query_mitre_cve(&self, query: &str) -> Vec<CveMatch> {
+    pub fn query_mitre_cve(&self, query: &str) -> Result<Vec<CveMatch>, String> {
         if query.trim().is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
-        // 1. Get real dense embedding for the user query from Ollama
-        let query_embedding = Self::fetch_embedding(query).unwrap_or_else(|| vec![0.0; 4096]);
+        // 1. Get real dense embedding for the user query from Ollama (Fail-Closed)
+        let query_embedding = Self::fetch_embedding(query)
+            .map_err(|e| format!("CRITICAL: Threat intelligence embedding API offline. Failing closed. Details: {}", e))?;
 
         let mut matches: Vec<CveMatch> = self
             .cves
             .iter()
-            .map(|cve| {
+            .filter_map(|cve| {
                 let doc_text = format!(
                     "{} {} {} {} {} {} {}",
                     cve.id,
@@ -129,47 +130,47 @@ impl RagEngine {
                     cve.tags.join(" ")
                 );
                 
-                // 2. Get real dense embedding for the document (normally cached in a Vector DB)
-                let doc_embedding = Self::fetch_embedding(&doc_text).unwrap_or_else(|| vec![0.0; 4096]);
+                // 2. Get real dense embedding for the document. If it fails, skip matching this document.
+                let doc_embedding = Self::fetch_embedding(&doc_text).ok()?;
                 
                 // 3. Compute real dense vector cosine similarity
                 let score = Self::dense_cosine_similarity(&query_embedding, &doc_embedding);
                 
-                CveMatch {
+                Some(CveMatch {
                     cve: cve.clone(),
                     similarity_score: score,
-                }
+                })
             })
             .filter(|m| m.similarity_score > 0.3) // Higher threshold for dense vectors
             .collect();
 
         matches.sort_by(|a, b| b.similarity_score.partial_cmp(&a.similarity_score).unwrap());
-        matches
+        Ok(matches)
     }
 
-    /// Fetches a real dense vector embedding from local Ollama
-    fn fetch_embedding(text: &str) -> Option<Vec<f32>> {
+    /// Fetches a real dense vector embedding securely using reqwest (blocking)
+    fn fetch_embedding(text: &str) -> Result<Vec<f32>, String> {
         let payload = serde_json::json!({
             "model": "nomic-embed-text",
             "prompt": text
         });
 
-        if let Ok(output) = std::process::Command::new("curl")
-            .arg("-s")
-            .arg("http://127.0.0.1:11434/api/embeddings")
-            .arg("-d")
-            .arg(payload.to_string())
-            .output() {
-                
-            if output.status.success() {
-                let resp: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_default();
-                if let Some(arr) = resp["embedding"].as_array() {
-                    let vec: Vec<f32> = arr.iter().filter_map(|v| v.as_f64().map(|f| f as f32)).collect();
-                    return Some(vec);
-                }
+        let client = reqwest::blocking::Client::new();
+        let resp = client.post("http://127.0.0.1:11434/api/embeddings")
+            .json(&payload)
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .map_err(|e| e.to_string())?;
+            
+        if resp.status().is_success() {
+            let json: serde_json::Value = resp.json().map_err(|e| e.to_string())?;
+            if let Some(arr) = json["embedding"].as_array() {
+                let vec: Vec<f32> = arr.iter().filter_map(|v| v.as_f64().map(|f| f as f32)).collect();
+                return Ok(vec);
             }
         }
-        None
+        
+        Err("Failed to parse embedding response".into())
     }
 
     /// Computes actual cosine similarity between two dense vectors
@@ -196,7 +197,7 @@ impl RagEngine {
     }
 }
 
-pub fn query_mitre_cve(query: &str) -> Vec<CveMatch> {
+pub fn query_mitre_cve(query: &str) -> Result<Vec<CveMatch>, String> {
     let engine = RagEngine::new();
     engine.query_mitre_cve(query)
 }

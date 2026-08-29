@@ -258,14 +258,7 @@ impl WebAuthnEngine {
     /// Parse raw WebAuthn authenticatorData structure (37+ bytes)
     pub fn parse_authenticator_data(data: &[u8]) -> Result<AuthenticatorData, String> {
         if data.len() < 37 {
-            // For short or simulated payloads, return fallback valid flags
-            return Ok(AuthenticatorData {
-                rp_id_hash: [0u8; 32],
-                flags: 0x05, // UP (0x01) | UV (0x04)
-                user_present: true,
-                user_verified: true,
-                sign_count: 1,
-            });
+            return Err("Authenticator data too short".to_string());
         }
 
         let mut rp_id_hash = [0u8; 32];
@@ -293,45 +286,13 @@ impl WebAuthnEngine {
         let stored = match challenges.remove(&req.challenge_id) {
             Some(c) => c,
             None => {
-                if req.challenge.is_empty() || req.signature.is_empty() {
-                    return VerifyChallengeResponse {
-                        verified: false,
-                        user_id: req.user_id.clone(),
-                        challenge_id: req.challenge_id.clone(),
-                        message: "Invalid or expired challenge ID".into(),
-                        session_token: None,
-                    };
-                }
-                // Fallback mock challenge for test harnesses
-                ChallengeResponse {
-                    challenge_id: req.challenge_id.clone(),
-                    challenge: req.challenge.clone(),
+                return VerifyChallengeResponse {
+                    verified: false,
                     user_id: req.user_id.clone(),
-                    rp_id: "jia.security".into(),
-                    timeout_ms: 60000,
-                    timestamp: chrono::Utc::now().to_rfc3339(),
-                    creation_options: PublicKeyCredentialCreationOptions {
-                        rp: PublicKeyCredentialRpEntity {
-                            name: "Jia Security".into(),
-                            id: "jia.security".into(),
-                        },
-                        user: PublicKeyCredentialUserEntity {
-                            id: req.user_id.clone(),
-                            name: req.user_id.clone(),
-                            display_name: req.user_id.clone(),
-                        },
-                        challenge: req.challenge.clone(),
-                        pub_key_cred_params: vec![],
-                        timeout: 60000,
-                        attestation: "none".into(),
-                    },
-                    request_options: PublicKeyCredentialRequestOptions {
-                        challenge: req.challenge.clone(),
-                        timeout: 60000,
-                        rp_id: "jia.security".into(),
-                        user_verification: "preferred".into(),
-                    },
-                }
+                    challenge_id: req.challenge_id.clone(),
+                    message: "Invalid or expired challenge ID".into(),
+                    session_token: None,
+                };
             }
         };
 
@@ -384,15 +345,18 @@ impl WebAuthnEngine {
         }
 
         // 4. Parse authenticatorData and check User Presence (UP) & User Verification (UV) flags
-        let auth_bytes = decode_base64url(&req.authenticator_data)
-            .unwrap_or_else(|_| req.authenticator_data.as_bytes().to_vec());
-        let auth_data = Self::parse_authenticator_data(&auth_bytes).unwrap_or(AuthenticatorData {
-            rp_id_hash: [0u8; 32],
-            flags: 0x05,
-            user_present: true,
-            user_verified: true,
-            sign_count: 1,
-        });
+        let auth_data = match Self::parse_authenticator_data(&auth_bytes) {
+            Ok(data) => data,
+            Err(e) => {
+                return VerifyChallengeResponse {
+                    verified: false,
+                    user_id: req.user_id.clone(),
+                    challenge_id: req.challenge_id.clone(),
+                    message: format!("Invalid authenticator data: {}", e),
+                    session_token: None,
+                };
+            }
+        };
 
         if !auth_data.user_present {
             return VerifyChallengeResponse {
@@ -461,8 +425,13 @@ impl WebAuthnEngine {
                 };
             }
         } else {
-            // Demo mode: No public key provided, enhanced validation (nonce, origin, flags) passed.
-            // Skipping cryptographic signature math as documented limitation.
+            return VerifyChallengeResponse {
+                verified: false,
+                user_id: req.user_id.clone(),
+                challenge_id: req.challenge_id.clone(),
+                message: "Missing public key for signature verification.".into(),
+                session_token: None,
+            };
         }
 
         let session_token = format!("fido2_auth_{}_{}", req.user_id, Uuid::new_v4());
