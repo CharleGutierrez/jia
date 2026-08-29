@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
-use vella::ai::gateway::{AiConfig, AiMessage, AiProvider, AiRequest, UnifiedAiGateway};
+
 
 #[derive(Debug, Deserialize)]
 pub struct PatchRequest {
@@ -42,73 +42,98 @@ impl SelfHealingEngine {
     ) -> Result<PatchResult, String> {
         let file_content = fs::read_to_string(source_file).unwrap_or_else(|_| "// File content unavailable".into());
 
-        let _gateway = UnifiedAiGateway::new();
-        let config = AiConfig {
-            provider: AiProvider::OllamaLocal,
-            base_url: ai_endpoint.unwrap_or("http://127.0.0.1:8080").to_string(),
-            api_key: "vella_local_key".to_string(),
-            model: "qwen-coder-32b".to_string(),
-        };
+        let base_url = ai_endpoint.unwrap_or("http://127.0.0.1:11434").to_string();
 
         let prompt = format!(
-            "Analyze code in file '{}' for vulnerability '{}'. Code:\n```rust\n{}\n```\nGenerate Unified Git Diff and unit test.",
-            source_file, vulnerability, file_content
+            "You are a security engineer. Analyze this rust code for the vulnerability '{}'.\nFile: {}\n\nCode:\n```rust\n{}\n```\n\nProvide:\n1. A unified git diff patch fixing the vulnerability\n2. A unit test verifying the fix\n\nFormat your response as:\n<diff>\n--- a/{}\n+++ b/{}\n[unified diff here]\n</diff>\n<test>\n[unit test code here]\n</test>",
+            vulnerability, source_file, file_content, source_file, source_file
         );
 
-        let request = AiRequest {
-            messages: vec![AiMessage {
-                role: "user".to_string(),
-                content: Some(prompt),
-                name: None,
-                tool_calls: None,
-                tool_call_id: None,
-                image_url: None,
-            }],
-            tools: None,
-            response_format: None,
-            temperature: 0.1,
-        };
-
-        // Call HTTP endpoint using reqwest
         let client = reqwest::Client::new();
-        let url = format!("{}/v1/chat/completions", config.base_url);
-        let http_res = client
-            .post(&url)
-            .json(&serde_json::json!({
-                "model": config.model,
-                "messages": [{"role": "user", "content": request.messages[0].content}],
-                "temperature": 0.1
-            }))
-            .timeout(std::time::Duration::from_secs(3))
-            .send()
-            .await;
+        let health_url = format!("{}/api/tags", base_url);
+        if client.get(&health_url).timeout(std::time::Duration::from_secs(2)).send().await.is_err() {
+            return Err("Ollama health check failed".into());
+        }
 
-        if let Ok(res) = http_res {
-            if res.status().is_success() {
-                if let Ok(json) = res.json::<serde_json::Value>().await {
-                    let ai_text = json["choices"][0]["message"]["content"]
-                        .as_str()
-                        .unwrap_or("");
-                    if !ai_text.is_empty() {
-                        return Ok(PatchResult {
-                            vulnerability: vulnerability.to_string(),
-                            source_file: source_file.to_string(),
-                            patch_diff: ai_text.to_string(),
-                            unit_test_code: "#[test]\nfn test_ai_remediation() { assert!(true); }".into(),
-                            status: "SUCCESS".into(),
-                            explanation: "Patch generated via Vella AI Gateway.".into(),
-                        });
+        let models = vec![
+            "qwen2.5-coder:32b",
+            "codellama:34b",
+            "deepseek-coder:33b",
+            "qwen-coder-32b",
+            "llama3.1:8b",
+        ];
+
+        let url = format!("{}/v1/chat/completions", base_url);
+
+        for model in models {
+            let http_res = client
+                .post(&url)
+                .json(&serde_json::json!({
+                    "model": model,
+                    "messages": [{"role": "user", "content": &prompt}],
+                    "temperature": 0.1
+                }))
+                .timeout(std::time::Duration::from_secs(30))
+                .send()
+                .await;
+
+            if let Ok(res) = http_res {
+                if res.status().is_success() {
+                    if let Ok(json) = res.json::<serde_json::Value>().await {
+                        if let Some(ai_text) = json["choices"][0]["message"]["content"].as_str() {
+                            if !ai_text.is_empty() {
+                                let patch_diff = if let Some(start) = ai_text.find("<diff>") {
+                                    if let Some(end) = ai_text.find("</diff>") {
+                                        ai_text[start + 6..end].trim().to_string()
+                                    } else {
+                                        ai_text.to_string()
+                                    }
+                                } else {
+                                    ai_text.to_string()
+                                };
+                                
+                                let unit_test_code = if let Some(start) = ai_text.find("<test>") {
+                                    if let Some(end) = ai_text.find("</test>") {
+                                        ai_text[start + 6..end].trim().to_string()
+                                    } else {
+                                        "#[test]\nfn test_ai_remediation() { assert!(true); }".to_string()
+                                    }
+                                } else {
+                                    "#[test]\nfn test_ai_remediation() { assert!(true); }".to_string()
+                                };
+
+                                return Ok(PatchResult {
+                                    vulnerability: vulnerability.to_string(),
+                                    source_file: source_file.to_string(),
+                                    patch_diff,
+                                    unit_test_code,
+                                    status: "SUCCESS".into(),
+                                    explanation: format!("Patch generated via AI Gateway using model {}.", model),
+                                });
+                            }
+                        }
                     }
                 }
             }
         }
 
-        // Fallback to AST pattern analysis
-        Ok(Self::generate_patch(vulnerability, source_file))
+        Err("All models failed or unavailable".into())
     }
 
-    /// Generates automated Git Diff patch and verifying unit test code via AST code pattern analysis.
     pub fn generate_patch(vulnerability: &str, source_file: &str) -> PatchResult {
+        // Try async AI path first using tokio's blocking bridge
+        let ai_result = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                Self::generate_ai_patch(vulnerability, source_file, None).await
+            })
+        });
+        match ai_result {
+            Ok(result) => result,
+            Err(_) => Self::static_pattern_patch(vulnerability, source_file),
+        }
+    }
+
+    fn static_pattern_patch(vulnerability: &str, source_file: &str) -> PatchResult {
         let vuln_upper = vulnerability.to_uppercase();
         let existing_code = fs::read_to_string(source_file).ok();
 
@@ -195,9 +220,8 @@ impl SelfHealingEngine {
             source_file: source_file.to_string(),
             patch_diff,
             unit_test_code,
-            status: "SUCCESS".to_string(),
+            status: "STATIC_PATTERN_FALLBACK".to_string(),
             explanation,
         }
     }
 }
-

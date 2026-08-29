@@ -107,10 +107,12 @@ impl RagEngine {
     }
 
     pub fn query_mitre_cve(&self, query: &str) -> Vec<CveMatch> {
-        let query_tokens = tokenize(query);
-        if query_tokens.is_empty() {
+        if query.trim().is_empty() {
             return Vec::new();
         }
+
+        // 1. Get real dense embedding for the user query from Ollama
+        let query_embedding = Self::fetch_embedding(query).unwrap_or_else(|| vec![0.0; 4096]);
 
         let mut matches: Vec<CveMatch> = self
             .cves
@@ -126,69 +128,75 @@ impl RagEngine {
                     cve.remediation,
                     cve.tags.join(" ")
                 );
-                let doc_tokens = tokenize(&doc_text);
-                let score = cosine_similarity(&query_tokens, &doc_tokens);
+                
+                // 2. Get real dense embedding for the document (normally cached in a Vector DB)
+                let doc_embedding = Self::fetch_embedding(&doc_text).unwrap_or_else(|| vec![0.0; 4096]);
+                
+                // 3. Compute real dense vector cosine similarity
+                let score = Self::dense_cosine_similarity(&query_embedding, &doc_embedding);
+                
                 CveMatch {
                     cve: cve.clone(),
                     similarity_score: score,
                 }
             })
-            .filter(|m| m.similarity_score > 0.05)
+            .filter(|m| m.similarity_score > 0.3) // Higher threshold for dense vectors
             .collect();
 
         matches.sort_by(|a, b| b.similarity_score.partial_cmp(&a.similarity_score).unwrap());
         matches
+    }
+
+    /// Fetches a real dense vector embedding from local Ollama
+    fn fetch_embedding(text: &str) -> Option<Vec<f32>> {
+        let payload = serde_json::json!({
+            "model": "nomic-embed-text",
+            "prompt": text
+        });
+
+        if let Ok(output) = std::process::Command::new("curl")
+            .arg("-s")
+            .arg("http://127.0.0.1:11434/api/embeddings")
+            .arg("-d")
+            .arg(payload.to_string())
+            .output() {
+                
+            if output.status.success() {
+                let resp: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_default();
+                if let Some(arr) = resp["embedding"].as_array() {
+                    let vec: Vec<f32> = arr.iter().filter_map(|v| v.as_f64().map(|f| f as f32)).collect();
+                    return Some(vec);
+                }
+            }
+        }
+        None
+    }
+
+    /// Computes actual cosine similarity between two dense vectors
+    fn dense_cosine_similarity(vec1: &[f32], vec2: &[f32]) -> f32 {
+        if vec1.len() != vec2.len() || vec1.is_empty() {
+            return 0.0;
+        }
+
+        let mut dot_product = 0.0;
+        let mut norm1_sq = 0.0;
+        let mut norm2_sq = 0.0;
+
+        for (a, b) in vec1.iter().zip(vec2.iter()) {
+            dot_product += a * b;
+            norm1_sq += a * a;
+            norm2_sq += b * b;
+        }
+
+        if norm1_sq == 0.0 || norm2_sq == 0.0 {
+            0.0
+        } else {
+            dot_product / (norm1_sq.sqrt() * norm2_sq.sqrt())
+        }
     }
 }
 
 pub fn query_mitre_cve(query: &str) -> Vec<CveMatch> {
     let engine = RagEngine::new();
     engine.query_mitre_cve(query)
-}
-
-fn tokenize(text: &str) -> Vec<String> {
-    text.to_lowercase()
-        .split(|c: char| !c.is_alphanumeric() && c != '-')
-        .filter(|s| s.len() > 1)
-        .map(|s| s.to_string())
-        .collect()
-}
-
-fn cosine_similarity(query_tokens: &[String], doc_tokens: &[String]) -> f32 {
-    let mut vocab: HashSet<String> = HashSet::new();
-    for token in query_tokens {
-        vocab.insert(token.clone());
-    }
-    for token in doc_tokens {
-        vocab.insert(token.clone());
-    }
-
-    let mut dot_product = 0.0f32;
-    let mut query_mag_sq = 0.0f32;
-    let mut doc_mag_sq = 0.0f32;
-
-    for term in vocab.iter() {
-        let q_freq = query_tokens.iter().filter(|t| *t == term).count() as f32;
-        let d_freq = doc_tokens.iter().filter(|t| *t == term).count() as f32;
-
-        // Give extra weight if term is an exact keyword match in tags or CVE ID
-        let weight = if term.starts_with("cve") || term == "rce" || term == "sqli" || term == "log4j" {
-            2.5
-        } else {
-            1.0
-        };
-
-        let q_val = q_freq * weight;
-        let d_val = d_freq * weight;
-
-        dot_product += q_val * d_val;
-        query_mag_sq += q_val * q_val;
-        doc_mag_sq += d_val * d_val;
-    }
-
-    if query_mag_sq == 0.0 || doc_mag_sq == 0.0 {
-        0.0
-    } else {
-        dot_product / (query_mag_sq.sqrt() * doc_mag_sq.sqrt())
-    }
 }

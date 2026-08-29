@@ -2,6 +2,7 @@ use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+use sqlx::{SqlitePool, Row};
 
 use crate::{AppState, TelemetryEvent, WormAuditEntry};
 
@@ -22,6 +23,80 @@ pub struct RollbackResponse {
     pub restored_hash: String,
     pub message: String,
     pub rollback_audit_entry: WormAuditEntry,
+}
+
+pub struct WormDatabase {
+    pub pool: SqlitePool,
+}
+
+impl WormDatabase {
+    pub async fn connect(path: &str) -> Result<SqlitePool, sqlx::Error> {
+        init_worm_db(path).await
+    }
+}
+
+pub async fn init_worm_db(db_path: &str) -> Result<sqlx::SqlitePool, sqlx::Error> {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .connect(&format!("sqlite:{}?mode=rwc", db_path))
+        .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS worm_audit_log (
+            id INTEGER PRIMARY KEY,
+            timestamp TEXT NOT NULL,
+            target TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            action TEXT NOT NULL,
+            previous_hash TEXT NOT NULL,
+            hash TEXT NOT NULL
+        );"
+    )
+    .execute(&pool)
+    .await?;
+
+    Ok(pool)
+}
+
+pub async fn persist_worm_entry(pool: &SqlitePool, entry: &WormAuditEntry) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO worm_audit_log (id, timestamp, target, reason, action, previous_hash, hash)
+         VALUES (?, ?, ?, ?, ?, ?, ?)"
+    )
+    .bind(entry.id as i64)
+    .bind(&entry.timestamp)
+    .bind(&entry.target)
+    .bind(&entry.reason)
+    .bind(&entry.action)
+    .bind(&entry.previous_hash)
+    .bind(&entry.hash)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn load_worm_entries_from_db(pool: &SqlitePool, up_to_id: usize) -> Vec<WormAuditEntry> {
+    let rows = sqlx::query(
+        "SELECT id, timestamp, target, reason, action, previous_hash, hash
+         FROM worm_audit_log
+         WHERE id <= ?
+         ORDER BY id ASC"
+    )
+    .bind(up_to_id as i64)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    rows.into_iter().map(|row| {
+        WormAuditEntry {
+            id: row.get::<i64, _>("id") as usize,
+            timestamp: row.get::<String, _>("timestamp"),
+            target: row.get::<String, _>("target"),
+            reason: row.get::<String, _>("reason"),
+            action: row.get::<String, _>("action"),
+            previous_hash: row.get::<String, _>("previous_hash"),
+            hash: row.get::<String, _>("hash"),
+        }
+    }).collect()
 }
 
 pub async fn rollback_handler(
@@ -63,6 +138,15 @@ pub async fn rollback_handler(
 
     // 1-Click Time-Travel State Restoration: Truncate WORM audit log state back to target snapshot
     logs.truncate(target_idx + 1);
+
+    // After truncating the Vec, reload from DB to restore real state
+    if let Ok(pool) = WormDatabase::connect("worm_audit.db").await {
+        let restored = load_worm_entries_from_db(&pool, target_idx + 1).await;
+        if !restored.is_empty() {
+            *logs = restored;
+        }
+    }
+
     let restored_version = logs.len();
     let restored_hash = logs.last().map(|e| e.hash.clone()).unwrap_or_default();
 
@@ -80,6 +164,10 @@ pub async fn rollback_handler(
         restored_hash.clone(),
     );
     logs.push(rollback_audit_entry.clone());
+
+    if let Ok(pool) = WormDatabase::connect("worm_audit.db").await {
+        let _ = persist_worm_entry(&pool, &rollback_audit_entry).await;
+    }
 
     // Broadcast disaster recovery telemetry
     let telemetry = TelemetryEvent {

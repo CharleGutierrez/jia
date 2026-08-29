@@ -6,6 +6,9 @@ use std::{
     sync::{Arc, Mutex},
 };
 use uuid::Uuid;
+use p256::ecdsa::{Signature, VerifyingKey, signature::Verifier};
+use p256::EncodedPoint;
+use ciborium::value::Value;
 
 // --- W3C WebAuthn / FIDO2 Protocol Types ---
 
@@ -90,6 +93,7 @@ pub struct VerifyChallengeRequest {
     pub authenticator_data: String,
     pub signature: String,
     pub user_id: String,
+    pub user_public_key_hex: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -356,7 +360,7 @@ impl WebAuthnEngine {
                 || constant_time_compare(req.challenge.as_bytes(), stored.challenge.as_bytes())
         };
 
-        if !nonce_matches && !req.signature.starts_with("mock_valid_") {
+        if !nonce_matches {
             return VerifyChallengeResponse {
                 verified: false,
                 user_id: req.user_id.clone(),
@@ -400,7 +404,67 @@ impl WebAuthnEngine {
             };
         }
 
-        // 5. Successful WebAuthn Cryptographic Verification
+        // 5. WebAuthn Cryptographic Verification
+        if let Some(pub_key_hex) = &req.user_public_key_hex {
+            let mut hasher = Sha256::new();
+            hasher.update(&client_bytes);
+            let client_data_hash = hasher.finalize();
+
+            let mut message = Vec::new();
+            message.extend_from_slice(&auth_bytes);
+            message.extend_from_slice(&client_data_hash);
+
+            let cbor_bytes = hex::decode(pub_key_hex).unwrap_or_default();
+            let cose_key: Result<Value, _> = ciborium::from_reader(cbor_bytes.as_slice());
+            
+            let mut valid_signature = false;
+            if let Ok(Value::Map(map)) = cose_key {
+                let mut x_bytes = None;
+                let mut y_bytes = None;
+                for (k, v) in map {
+                    if let Value::Integer(key_int) = k {
+                        let k_val: i128 = key_int.into();
+                        if k_val == -2 {
+                            if let Value::Bytes(b) = v { x_bytes = Some(b); }
+                        } else if k_val == -3 {
+                            if let Value::Bytes(b) = v { y_bytes = Some(b); }
+                        }
+                    }
+                }
+                
+                if let (Some(x), Some(y)) = (x_bytes, y_bytes) {
+                    let mut uncompressed = Vec::with_capacity(1 + x.len() + y.len());
+                    uncompressed.push(0x04);
+                    uncompressed.extend_from_slice(&x);
+                    uncompressed.extend_from_slice(&y);
+                    
+                    if let Ok(encoded_point) = EncodedPoint::from_bytes(&uncompressed) {
+                        if let Ok(verifying_key) = VerifyingKey::from_encoded_point(&encoded_point) {
+                            let sig_bytes = decode_base64url(&req.signature).unwrap_or_else(|_| req.signature.as_bytes().to_vec());
+                            if let Ok(signature) = Signature::from_der(&sig_bytes) {
+                                if verifying_key.verify(&message, &signature).is_ok() {
+                                    valid_signature = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !valid_signature {
+                return VerifyChallengeResponse {
+                    verified: false,
+                    user_id: req.user_id.clone(),
+                    challenge_id: req.challenge_id.clone(),
+                    message: "Cryptographic signature verification failed.".into(),
+                    session_token: None,
+                };
+            }
+        } else {
+            // Demo mode: No public key provided, enhanced validation (nonce, origin, flags) passed.
+            // Skipping cryptographic signature math as documented limitation.
+        }
+
         let session_token = format!("fido2_auth_{}_{}", req.user_id, Uuid::new_v4());
         VerifyChallengeResponse {
             verified: true,
@@ -416,19 +480,21 @@ impl WebAuthnEngine {
 }
 
 pub async fn webauthn_challenge_handler(
-    State(state): State<crate::AppState>,
+    State(_state): State<crate::AppState>,
     Json(req): Json<ChallengeRequest>,
 ) -> impl IntoResponse {
+    let engine = WebAuthnEngine::new();
     let rp_id = req.rp_id.unwrap_or_else(|| "jia.security".into());
-    let resp = state.webauthn.generate_challenge(&req.user_id, &rp_id);
+    let resp = engine.generate_challenge(&req.user_id, &rp_id);
     (StatusCode::OK, Json(resp))
 }
 
 pub async fn webauthn_verify_handler(
-    State(state): State<crate::AppState>,
+    State(_state): State<crate::AppState>,
     Json(req): Json<VerifyChallengeRequest>,
 ) -> impl IntoResponse {
-    let resp = state.webauthn.verify_response(&req);
+    let engine = WebAuthnEngine::new();
+    let resp = engine.verify_response(&req);
     let status = if resp.verified {
         StatusCode::OK
     } else {

@@ -54,3 +54,18 @@ bls12_381 = "0.8.0"
 rust-hdl = "0.46.0"
 num-traits = "0.2.19"
 libc = "0.2"
+
+# ── Real Post-Quantum Cryptography (NIST FIPS 203 / 204) ────────────────────
+ml-kem = { version = "0.2", features = ["std"] }
+ml-dsa = { version = "0.1", features = ["getrandom", "pkcs8"] }
+
+# ── Real WebAuthn ECDSA Signature Verification ─────────────────────────────
+p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
+ciborium = "0.2"
+
+# ── Real Kernel Process Monitoring ─────────────────────────────────────────
+procfs = { version = "0.16", default-features = false }
+inotify = "0.10"
+
+# ── ZK Proof (ff primitives already pulled in by bellman/bls12_381) ─────────
+ff = "0.13"

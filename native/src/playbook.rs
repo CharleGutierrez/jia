@@ -4,6 +4,7 @@ use std::{
     fs,
     path::Path,
     sync::{Arc, Mutex},
+    process::Command,
 };
 use tracing::info;
 
@@ -69,16 +70,50 @@ impl PlaybookEngine {
 
         engine.register_fn("revoke_jwt", move |user_or_token: String| -> String {
             info!("🛡️ [Rhai Playbook] Revoking JWT / Session Token for target: {}", user_or_token);
-            let res = format!("JWT_REVOKED:{}", user_or_token);
-            actions_taken_clone1.lock().unwrap().push(res.clone());
-            res
+            let mut res_str = format!("JWT_REVOKED:{}", user_or_token);
+            
+            // Actually connect to redis and revoke
+            match redis::Client::open("redis://127.0.0.1:6379/") {
+                Ok(client) => {
+                    match client.get_connection() {
+                        Ok(mut con) => {
+                            let _: () = redis::cmd("SADD").arg("jia:revoked_jwts").arg(&user_or_token).query(&mut con).unwrap_or(());
+                        }
+                        Err(e) => {
+                            res_str = format!("JWT_REVOKE_FAILED_REDIS_ERR:{}", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    res_str = format!("JWT_REVOKE_FAILED_REDIS_ERR:{}", e);
+                }
+            }
+
+            actions_taken_clone1.lock().unwrap().push(res_str.clone());
+            res_str
         });
 
         engine.register_fn("block_ip", move |ip: String| -> String {
             info!("🛡️ [Rhai Playbook] Adding IP firewall block rule for: {}", ip);
-            let res = format!("IP_BLOCKED:{}", ip);
-            actions_taken_clone2.lock().unwrap().push(res.clone());
-            res
+            
+            let mut res_str = format!("IP_BLOCKED:{}", ip);
+            let iptables_status = Command::new("iptables")
+                .args(&["-A", "INPUT", "-s", &ip, "-j", "DROP"])
+                .output();
+            
+            if let Ok(output) = iptables_status {
+                if !output.status.success() {
+                    // Fallback to file append if no root permissions
+                    let _ = Command::new("sh").arg("-c").arg(format!("echo {} >> /tmp/jia_blocked_ips.txt", ip)).status();
+                    res_str = format!("IP_BLOCKED_FILE_FALLBACK:{}", ip);
+                }
+            } else {
+                let _ = Command::new("sh").arg("-c").arg(format!("echo {} >> /tmp/jia_blocked_ips.txt", ip)).status();
+                res_str = format!("IP_BLOCKED_FILE_FALLBACK:{}", ip);
+            }
+
+            actions_taken_clone2.lock().unwrap().push(res_str.clone());
+            res_str
         });
 
         engine.register_fn("record_worm_log", move |tgt: String, rsn: String, act: String| -> String {
@@ -128,7 +163,6 @@ impl PlaybookEngine {
             fs::read_to_string(&file_path)
                 .map_err(|e| format!("Failed to read playbook file {}: {}", file_path, e))
         } else {
-            // Default built-in embedded playbooks
             match name {
                 "quarantine" | "quarantine.rhai" => Ok(r#"
 let jwt_res = revoke_jwt(target);
@@ -137,23 +171,54 @@ let worm_res = record_worm_log(target, reason, "QUARANTINE_AUTOMATED_REMEDIATION
 log_info("Executed automated quarantine playbook for target: " + target);
 "PLAYBOOK_QUARANTINE_SUCCESS: " + jwt_res + " | " + ip_res + " | " + worm_res
 "#.trim().to_string()),
-
                 "ip_block" | "ip_block.rhai" => Ok(r#"
 let ip_res = block_ip(target);
 let worm_res = record_worm_log(target, reason, "IP_FIREWALL_BLOCK");
 log_info("Executed IP block playbook for IP: " + target);
 "PLAYBOOK_IP_BLOCK_SUCCESS: " + ip_res + " | " + worm_res
 "#.trim().to_string()),
-
                 "revoke_jwt" | "revoke_jwt.rhai" => Ok(r#"
 let jwt_res = revoke_jwt(target);
 let worm_res = record_worm_log(target, reason, "JWT_REVOCATION");
 log_info("Executed JWT revocation playbook for user/token: " + target);
 "PLAYBOOK_JWT_REVOKE_SUCCESS: " + jwt_res + " | " + worm_res
 "#.trim().to_string()),
-
-                _ => Err(format!("Playbook '{}' not found and no embedded default exists.", name)),
+                _ => {
+                    // Try to generate dynamically via Ollama instead of throwing error
+                    let prompt = format!("Write a Rhai script to handle a security incident. The playbook name is '{}'. You have these functions: revoke_jwt(target), block_ip(target), record_worm_log(target, reason, action), log_info(msg). The variables 'target' and 'reason' are available globally. Output ONLY the raw Rhai script text without Markdown blocks.", name);
+                    let payload = serde_json::json!({
+                        "model": "deepseek-coder:33b",
+                        "prompt": prompt,
+                        "stream": false
+                    });
+                    
+                    if let Ok(output) = std::process::Command::new("curl")
+                        .arg("-s")
+                        .arg("http://127.0.0.1:11434/api/generate")
+                        .arg("-d")
+                        .arg(payload.to_string())
+                        .output() {
+                            
+                        if output.status.success() {
+                            let resp: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_default();
+                            if let Some(resp_text) = resp["response"].as_str() {
+                                let mut clean_text = resp_text.trim();
+                                if clean_text.starts_with("```rhai") {
+                                    clean_text = clean_text.trim_start_matches("```rhai");
+                                } else if clean_text.starts_with("```") {
+                                    clean_text = clean_text.trim_start_matches("```");
+                                }
+                                if clean_text.ends_with("```") {
+                                    clean_text = clean_text.trim_end_matches("```");
+                                }
+                                return Ok(clean_text.trim().to_string());
+                            }
+                        }
+                    }
+                    Err(format!("Playbook '{}' not found and dynamic generation failed.", name))
+                }
             }
         }
     }
 }
+

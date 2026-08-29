@@ -1,7 +1,19 @@
-use rand::{RngCore, thread_rng};
+use rand::thread_rng;
 use serde::{Deserialize, Serialize};
-use sha3::digest::{ExtendableOutput, Update, XofReader};
-use sha3::{Digest, Sha3_256, Shake256};
+
+// ── ML-KEM (NIST FIPS 203) — Key Encapsulation Mechanism ───────────────────
+use ml_kem::kem::{EncapsulationKey, DecapsulationKey, Encapsulate, Decapsulate};
+use ml_kem::{KemCore, MlKem768, MlKem768Params, EncodedSizeUser};
+
+// ── ML-DSA (NIST FIPS 204) — Digital Signature Algorithm ───────────────────
+use ml_dsa::{MlDsa65, signature::{Signer, Verifier, Keypair}};
+use ml_dsa::Generate;
+// PKCS8 DER serialization for signing keys (raw &[u8] TryFrom not available)
+use ml_dsa::pkcs8::{DecodePrivateKey, EncodePrivateKey};
+// SPKI DER serialization for verifying keys (SubjectPublicKeyInfo format)
+use ml_dsa::pkcs8::spki::{DecodePublicKey, EncodePublicKey};
+
+// ── Public types used by main.rs ─────────────────────────────────────────────
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct KyberKeyPair {
@@ -48,136 +60,202 @@ pub struct PqcSignResponse {
 pub struct PqcEngine;
 
 impl PqcEngine {
-    /// ML-KEM (Kyber-768) Key Pair Generation:
-    /// Produces a full 1184-byte Kyber-768 public key and 2400-byte secret key derived via SHAKE-256.
+    // ── ML-KEM-768: Key Encapsulation ────────────────────────────────────────
+    //
+    // Uses real NIST FIPS-203 ML-KEM-768 algorithm via the RustCrypto `ml-kem`
+    // crate. The keys are genuine Module-Lattice-based cryptographic objects,
+    // not pseudo-random byte expansions.
+
+    /// Generate a real ML-KEM-768 keypair (encapsulation + decapsulation keys).
     pub fn kyber768_generate_keypair() -> KyberKeyPair {
-        let mut seed = [0u8; 32];
-        thread_rng().fill_bytes(&mut seed);
-
-        let mut hasher = Shake256::default();
-        hasher.update(b"ML_KEM_768_KEYGEN_SEED_V1");
-        hasher.update(&seed);
-        let mut reader = hasher.finalize_xof();
-
-        let mut pk_bytes = [0u8; 1184]; // Standard Kyber-768 Public Key size = 1184 bytes
-        let mut sk_bytes = [0u8; 2400]; // Standard Kyber-768 Secret Key size = 2400 bytes
-
-        reader.read(&mut pk_bytes);
-        reader.read(&mut sk_bytes);
-
+        let mut rng = thread_rng();
+        let (dk, ek) = MlKem768::generate(&mut rng);
         KyberKeyPair {
-            public_key_hex: hex::encode(pk_bytes),
-            secret_key_hex: hex::encode(sk_bytes),
+            public_key_hex: hex::encode(ek.as_bytes()),
+            secret_key_hex: hex::encode(dk.as_bytes()),
             algorithm: "ML-KEM-768".to_string(),
         }
     }
 
-    /// ML-KEM-768 Key Encapsulation:
-    /// Takes a 1184-byte public key, generates a random seed m, and derives a full 1088-byte Kyber ciphertext
-    /// and 32-byte shared secret using SHAKE-256.
+    /// Encapsulate a shared secret with a real ML-KEM-768 public key.
     pub fn kyber768_encapsulate(public_key_hex: &str) -> KyberEncapsulation {
-        let mut m = [0u8; 32];
-        thread_rng().fill_bytes(&mut m);
-
-        let mut hasher = Shake256::default();
-        hasher.update(b"ML_KEM_768_ENCAPSULATE_V1");
-        hasher.update(public_key_hex.as_bytes());
-        hasher.update(&m);
-        let mut reader = hasher.finalize_xof();
-
-        let mut ct_bytes = [0u8; 1088]; // Standard Kyber-768 Ciphertext size = 1088 bytes
-        let mut ss_bytes = [0u8; 32];   // 256-bit Shared Secret
-
-        reader.read(&mut ct_bytes);
-        reader.read(&mut ss_bytes);
-
+        let mut rng = thread_rng();
+        let pk_bytes = hex::decode(public_key_hex).expect("Invalid hex for ML-KEM-768 public key");
+        let arr = pk_bytes.as_slice().try_into().expect("Invalid ML-KEM-768 public key size");
+        let ek = EncapsulationKey::<MlKem768Params>::from_bytes(arr);
+        let (ct, ss) = ek.encapsulate(&mut rng).unwrap();
         KyberEncapsulation {
-            ciphertext_hex: hex::encode(ct_bytes),
-            shared_secret_hex: hex::encode(ss_bytes),
+            ciphertext_hex: hex::encode(ct),
+            shared_secret_hex: hex::encode(ss),
         }
     }
 
-    /// ML-DSA (Dilithium3 / ML-DSA-65) Key Pair Generation:
-    /// Derives 1952-byte public key and secret key using SHAKE-256 matrix expansion.
+    /// Decapsulate a shared secret with a real ML-KEM-768 secret key.
+    pub fn kyber768_decapsulate(secret_key_hex: &str, ciphertext_hex: &str) -> String {
+        let sk_bytes = hex::decode(secret_key_hex).expect("Invalid hex for ML-KEM-768 secret key");
+        let sk_arr = sk_bytes.as_slice().try_into().expect("Invalid ML-KEM-768 secret key size");
+        let dk = DecapsulationKey::<MlKem768Params>::from_bytes(sk_arr);
+        let ct_bytes = hex::decode(ciphertext_hex).expect("Invalid hex for ML-KEM-768 ciphertext");
+        let ct = ct_bytes.as_slice().try_into().expect("Invalid ML-KEM-768 ciphertext bytes");
+        let ss = dk.decapsulate(&ct).unwrap();
+        hex::encode(ss)
+    }
+
+    // ── ML-DSA-65: Digital Signatures ────────────────────────────────────────
+    //
+    // Uses real NIST FIPS-204 ML-DSA-65 algorithm via the RustCrypto `ml-dsa`
+    // crate. Keys are serialized as PKCS8/SPKI DER (the standard format for
+    // ML-DSA keys) because the raw-bytes TryFrom path is not exposed by the
+    // crate — only the ASN.1-structured formats are stable public API.
+
+    /// Generate a real ML-DSA-65 keypair. Keys are hex-encoded PKCS8/SPKI DER.
     pub fn dilithium_generate_keypair() -> DilithiumKeyPair {
-        let mut seed = [0u8; 32];
-        thread_rng().fill_bytes(&mut seed);
+        let sk = ml_dsa::SigningKey::<MlDsa65>::generate();
 
-        let mut hasher = Shake256::default();
-        hasher.update(b"ML_DSA_65_KEYGEN_SEED_V1");
-        hasher.update(&seed);
-        let mut reader = hasher.finalize_xof();
+        // Encode signing key as PKCS8 DER (PrivateKeyInfo format, RFC 5958)
+        let sk_der = sk
+            .to_pkcs8_der()
+            .expect("ML-DSA-65 signing key PKCS8 DER encoding failed");
 
-        let mut pk_bytes = [0u8; 1952]; // ML-DSA-65 Public Key size = 1952 bytes
-        let mut sk_bytes = [0u8; 3296]; // ML-DSA-65 Secret Key size = 3296 bytes
-
-        reader.read(&mut pk_bytes);
-        reader.read(&mut sk_bytes);
+        // Encode verifying key as SPKI DER (SubjectPublicKeyInfo format, RFC 5480)
+        let vk_der = sk.verifying_key()
+            .to_public_key_der()
+            .expect("ML-DSA-65 verifying key SPKI DER encoding failed");
 
         DilithiumKeyPair {
-            public_key_hex: hex::encode(pk_bytes),
-            secret_key_hex: hex::encode(sk_bytes),
+            public_key_hex: hex::encode(vk_der.as_bytes()),
+            secret_key_hex: hex::encode(sk_der.as_bytes()),
             algorithm: "ML-DSA-65".to_string(),
         }
     }
 
-    /// ML-DSA (Dilithium) Digital Signature Generator over WORM audit log entries:
-    /// Uses SHAKE-256 KMAC over entry & secret_key to output a 2420-byte Dilithium signature.
+    /// Sign a WORM audit entry using a real ML-DSA-65 signing key.
     pub fn dilithium_sign_worm_log(entry: &str, secret_key_hex: &str) -> DilithiumSignature {
-        let mut hasher = Shake256::default();
-        hasher.update(b"WORM_AUDIT_LOG_ML_DSA_65_KMAC_V1");
-        hasher.update(secret_key_hex.as_bytes());
-        hasher.update(entry.as_bytes());
-        let mut reader = hasher.finalize_xof();
+        let sk_bytes =
+            hex::decode(secret_key_hex).expect("Invalid hex for ML-DSA-65 secret key");
 
-        let mut sig_bytes = [0u8; 2420]; // ML-DSA Dilithium signature size = 2420 bytes
-        reader.read(&mut sig_bytes);
+        // Deserialize from PKCS8 DER — this is the real cryptographic key material
+        let signing_key = ml_dsa::SigningKey::<MlDsa65>::from_pkcs8_der(&sk_bytes)
+            .expect("Invalid ML-DSA-65 PKCS8 DER secret key");
 
-        // Derive public key from secret key using SHAKE-256 binding
-        let mut pk_hasher = Shake256::default();
-        pk_hasher.update(b"ML_DSA_65_DERIVE_PK_FROM_SK");
-        pk_hasher.update(secret_key_hex.as_bytes());
-        let mut pk_reader = pk_hasher.finalize_xof();
-        let mut derived_pk = [0u8; 1952];
-        pk_reader.read(&mut derived_pk);
+        // Perform real ML-DSA-65 lattice-based signing
+        let sig = signing_key.sign(entry.as_bytes());
+
+        // Encode the verifying key so the caller can store it
+        let vk_der = signing_key
+            .verifying_key()
+            .to_public_key_der()
+            .expect("ML-DSA-65 verifying key SPKI DER encoding failed");
 
         DilithiumSignature {
-            signature_hex: hex::encode(sig_bytes),
-            public_key_hex: hex::encode(derived_pk),
+            signature_hex: hex::encode(sig.encode()),
+            public_key_hex: hex::encode(vk_der.as_bytes()),
             algorithm: "ML-DSA-65".to_string(),
         }
     }
 
-    /// ML-DSA (Dilithium) Digital Signature Verifier for WORM audit log integrity:
-    /// Performs SHAKE-256 KMAC verification over log entry, 2420-byte signature, and public key.
-    pub fn dilithium_verify_worm_log(entry: &str, signature_hex: &str, public_key_hex: &str) -> bool {
+    /// Verify a ML-DSA-65 signature over a WORM audit entry.
+    ///
+    /// This is a REAL verification — not `!sig.is_empty()`.
+    /// A wrong message, wrong key, or tampered signature all return `false`.
+    pub fn dilithium_verify_worm_log(
+        entry: &str,
+        signature_hex: &str,
+        public_key_hex: &str,
+    ) -> bool {
+        // Decode hex-encoded SPKI DER verifying key
+        let pk_bytes = match hex::decode(public_key_hex) {
+            Ok(b) => b,
+            Err(_) => return false,
+        };
+        let vk = match ml_dsa::VerifyingKey::<MlDsa65>::from_public_key_der(&pk_bytes) {
+            Ok(vk) => vk,
+            Err(_) => return false,
+        };
+
+        // Decode hex-encoded signature
         let sig_bytes = match hex::decode(signature_hex) {
             Ok(b) => b,
             Err(_) => return false,
         };
 
-        // Dilithium signature must be exactly 2420 bytes
-        if sig_bytes.len() != 2420 {
-            return false;
-        }
+        let sig_arr = match sig_bytes.as_slice().try_into() {
+            Ok(arr) => arr,
+            Err(_) => return false,
+        };
+        let sig = match ml_dsa::Signature::<MlDsa65>::decode(&sig_arr) {
+            Some(sig) => sig,
+            None => return false,
+        };
 
-        let mut verifier = Shake256::default();
-        verifier.update(b"WORM_AUDIT_LOG_ML_DSA_65_KMAC_VERIFY");
-        verifier.update(public_key_hex.as_bytes());
-        verifier.update(entry.as_bytes());
-        verifier.update(&sig_bytes);
-
-        let mut v_reader = verifier.finalize_xof();
-        let mut verify_tag = [0u8; 32];
-        v_reader.read(&mut verify_tag);
-
-        // Verify SHA3-256 digest binding over entry
-        let mut sha3_digest = Sha3_256::new();
-        Digest::update(&mut sha3_digest, entry.as_bytes());
-        let _worm_hash = sha3_digest.finalize();
-
-        // Signature validation check
-        !signature_hex.is_empty() && !public_key_hex.is_empty()
+        // Real ML-DSA-65 lattice-based signature verification
+        vk.verify(entry.as_bytes(), &sig).is_ok()
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Full ML-KEM-768 round-trip: generate → encapsulate → decapsulate.
+    /// The shared secrets from encapsulation and decapsulation MUST match.
+    #[test]
+    fn test_kyber768_full_cycle() {
+        let keypair = PqcEngine::kyber768_generate_keypair();
+        assert_eq!(keypair.algorithm, "ML-KEM-768");
+        assert!(!keypair.public_key_hex.is_empty());
+        assert!(!keypair.secret_key_hex.is_empty());
+
+        let enc = PqcEngine::kyber768_encapsulate(&keypair.public_key_hex);
+        assert!(!enc.ciphertext_hex.is_empty());
+        assert!(!enc.shared_secret_hex.is_empty());
+
+        let dec_ss =
+            PqcEngine::kyber768_decapsulate(&keypair.secret_key_hex, &enc.ciphertext_hex);
+        // IND-CCA2 correctness: both sides must derive the same shared secret
+        assert_eq!(enc.shared_secret_hex, dec_ss);
+    }
+
+    /// Full ML-DSA-65 round-trip: generate → sign → verify.
+    /// Also verifies that a tampered message correctly FAILS (the old fake
+    /// implementation returned true for any non-empty inputs).
+    #[test]
+    fn test_dilithium_full_cycle() {
+        let keypair = PqcEngine::dilithium_generate_keypair();
+        assert_eq!(keypair.algorithm, "ML-DSA-65");
+        assert!(!keypair.public_key_hex.is_empty());
+        assert!(!keypair.secret_key_hex.is_empty());
+
+        let entry = "WORM AUDIT: suspicious lateral movement detected from 10.0.0.42";
+        let sig = PqcEngine::dilithium_sign_worm_log(entry, &keypair.secret_key_hex);
+        assert_eq!(sig.algorithm, "ML-DSA-65");
+        assert!(!sig.signature_hex.is_empty());
+        // The public key embedded in the signature must match the generated one
+        assert_eq!(sig.public_key_hex, keypair.public_key_hex);
+
+        // ✅ Correct entry + correct key → must verify
+        let is_valid = PqcEngine::dilithium_verify_worm_log(
+            entry,
+            &sig.signature_hex,
+            &keypair.public_key_hex,
+        );
+        assert!(is_valid, "Valid ML-DSA-65 signature must verify successfully");
+
+        // ❌ Tampered entry → must FAIL (this is the key difference from the fake impl)
+        let is_tampered = PqcEngine::dilithium_verify_worm_log(
+            "TAMPERED: injected false audit record",
+            &sig.signature_hex,
+            &keypair.public_key_hex,
+        );
+        assert!(!is_tampered, "Tampered entry must NOT pass ML-DSA-65 verification");
+
+        // ❌ Wrong key → must FAIL
+        let other_keypair = PqcEngine::dilithium_generate_keypair();
+        let is_wrong_key = PqcEngine::dilithium_verify_worm_log(
+            entry,
+            &sig.signature_hex,
+            &other_keypair.public_key_hex,
+        );
+        assert!(!is_wrong_key, "Wrong public key must NOT pass ML-DSA-65 verification");
+    }
+}
