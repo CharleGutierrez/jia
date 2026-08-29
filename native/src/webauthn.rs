@@ -279,12 +279,16 @@ impl WebAuthnEngine {
     /// Verify WebAuthn / FIDO2 Cryptographic Assertion & ClientDataJSON
     pub async fn verify_response(&self, req: &VerifyChallengeRequest) -> VerifyChallengeResponse {
         // 1. Fetch challenge from SQLite
-        let challenge_record = sqlx::query!("SELECT user_id, challenge_base64 FROM challenges WHERE challenge_id = ?", req.challenge_id)
+        let challenge_record = sqlx::query("SELECT user_id, challenge_base64 FROM challenges WHERE challenge_id = ?")
+            .bind(&req.challenge_id)
             .fetch_optional(&self.db_pool)
             .await;
 
         let (stored_user_id, stored_challenge) = match challenge_record {
-            Ok(Some(record)) => (record.user_id, record.challenge_base64),
+            Ok(Some(record)) => {
+                use sqlx::Row;
+                (record.get::<String, _>("user_id"), record.get::<String, _>("challenge_base64"))
+            },
             _ => {
                 return VerifyChallengeResponse {
                     verified: false,
@@ -297,7 +301,8 @@ impl WebAuthnEngine {
         };
 
         // 2. Delete the challenge (one-time use)
-        let _ = sqlx::query!("DELETE FROM challenges WHERE challenge_id = ?", req.challenge_id)
+        let _ = sqlx::query("DELETE FROM challenges WHERE challenge_id = ?")
+            .bind(&req.challenge_id)
             .execute(&self.db_pool).await;
 
         if stored_user_id != req.user_id {
@@ -377,18 +382,24 @@ impl WebAuthnEngine {
 
         // 5. WebAuthn Cryptographic Verification using database key
         // Fetch user public key from DB
-        let user_record = sqlx::query!("SELECT public_key_cbor_hex FROM users WHERE id = ?", req.user_id)
+        let user_record = sqlx::query("SELECT public_key_cbor_hex FROM users WHERE id = ?")
+            .bind(&req.user_id)
             .fetch_optional(&self.db_pool)
             .await
             .unwrap_or(None);
 
         let pub_key_hex = match user_record {
-            Some(record) => record.public_key_cbor_hex,
+            Some(record) => {
+                use sqlx::Row;
+                record.get::<String, _>("public_key_cbor_hex")
+            },
             None => {
                 // Trust On First Use (TOFU) - Auto-register new users
                 if let Some(ref pk) = req.user_public_key_hex {
-                    let _ = sqlx::query!("INSERT INTO users (id, username, public_key_cbor_hex) VALUES (?, ?, ?)", 
-                        req.user_id, req.user_id, pk)
+                    let _ = sqlx::query("INSERT INTO users (id, username, public_key_cbor_hex) VALUES (?, ?, ?)")
+                        .bind(&req.user_id)
+                        .bind(&req.user_id)
+                        .bind(pk)
                         .execute(&self.db_pool).await;
                     pk.clone()
                 } else {

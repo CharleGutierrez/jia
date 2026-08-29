@@ -35,6 +35,7 @@ pub mod rag_agent;
 pub mod rag_poison_guard;
 pub mod sandbox;
 pub mod self_healing;
+pub mod webauthn;
 mod yara_engine;
 pub mod zk_proof;
 
@@ -212,6 +213,8 @@ async fn main() {
         .route("/api/v1/rag/guard", post(rag_guard_handler))
         .route("/api/v1/self_heal/patch", post(self_heal_patch_handler))
         .route("/api/v1/red_team/simulate", post(red_team_simulate_handler))
+        .route("/api/v1/auth/challenge", post(webauthn::webauthn_challenge_handler))
+        .route("/api/v1/auth/verify", post(webauthn::webauthn_verify_handler))
         .route("/ws/telemetry", get(ws_telemetry_handler))
         .layer(cors)
         .with_state(state);
