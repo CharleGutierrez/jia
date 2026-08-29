@@ -1,0 +1,17 @@
+# Build & binary artifacts
+target/
+build/
+*.o
+*.so
+*.dylib
+*.dll
+*.exe
+
+# Gleam build outputs
+/build
+/manifest.toml
+
+# Environment & local secrets
+.env
+.env.*
+*.log
