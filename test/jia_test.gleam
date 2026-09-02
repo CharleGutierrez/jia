@@ -20,6 +20,20 @@ import jia/circuit_breaker.{
 }
 import jia/rag_poison_guard
 import jia/red_team
+import jia/crdt
+import jia/gameday
+import jia/worker_pool
+import jia/supervisor
+import jia/actor
+import jia/raft
+import jia/threat_hunter
+import jia/cli
+import jia/deception_maze
+import jia/self_patcher
+
+
+
+
 
 pub fn main() {
   gleeunit.main()
@@ -330,4 +344,206 @@ pub fn stride_threat_model_verification_test() {
   clean_report.is_compliant |> should.equal(True)
   clean_report.total_detected |> should.equal(0)
 }
+
+pub fn crdt_gset_and_orset_test() {
+  // 1. Test G-Set (Grow-Only Set)
+  let gset1 = crdt.gset_new() |> crdt.gset_add("1.1.1.1") |> crdt.gset_add("2.2.2.2")
+  let gset2 = crdt.gset_new() |> crdt.gset_add("2.2.2.2") |> crdt.gset_add("3.3.3.3")
+  let merged_gset = crdt.gset_merge(gset1, gset2)
+
+  crdt.gset_contains(merged_gset, "1.1.1.1") |> should.equal(True)
+  crdt.gset_contains(merged_gset, "2.2.2.2") |> should.equal(True)
+  crdt.gset_contains(merged_gset, "3.3.3.3") |> should.equal(True)
+  list.length(crdt.gset_to_list(merged_gset)) |> should.equal(3)
+
+  // 2. Test OR-Set (Observed-Remove Set)
+  let orset =
+    crdt.orset_new()
+    |> crdt.orset_add("10.0.0.1", "tag1")
+    |> crdt.orset_add("10.0.0.2", "tag2")
+
+  crdt.orset_contains(orset, "10.0.0.1") |> should.equal(True)
+
+  let orset_removed = crdt.orset_remove(orset, "10.0.0.1")
+  crdt.orset_contains(orset_removed, "10.0.0.1") |> should.equal(False)
+  crdt.orset_contains(orset_removed, "10.0.0.2") |> should.equal(True)
+
+  // Test Concurrent Add/Remove Convergence
+  let replica_a = crdt.orset_add(orset_removed, "10.0.0.3", "tag_a")
+  let replica_b = crdt.orset_add(orset_removed, "10.0.0.4", "tag_b")
+  let merged_or = crdt.orset_merge(replica_a, replica_b)
+
+  crdt.orset_contains(merged_or, "10.0.0.3") |> should.equal(True)
+  crdt.orset_contains(merged_or, "10.0.0.4") |> should.equal(True)
+  crdt.orset_contains(merged_or, "10.0.0.1") |> should.equal(False)
+}
+
+pub fn worker_pool_test() {
+  let assert Ok(pool_sub) = worker_pool.start(4)
+
+  let log =
+    SecurityLog(
+      source_ip: "10.10.10.10",
+      payload: "GET /api/v1/status",
+      prompt: None,
+      user_id: Some("user_test"),
+    )
+
+  let reply_sub = process.new_subject()
+  process.send(pool_sub, worker_pool.SubmitTask(log, reply_sub))
+  let report = process.receive_forever(reply_sub)
+  report.risk_level |> should.equal(LowRisk)
+
+  let stats_sub = process.new_subject()
+  process.send(pool_sub, worker_pool.GetPoolStats(stats_sub))
+  let stats = process.receive_forever(stats_sub)
+  { stats.completed_jobs >= 1 } |> should.equal(True)
+}
+
+pub fn supervisor_tree_test() {
+  let assert Ok(sup_sub) = supervisor.start()
+
+  let req_actor = process.new_subject()
+  process.send(sup_sub, supervisor.GetThreatActor(req_actor))
+  let threat_actor = process.receive_forever(req_actor)
+
+  let req_pool = process.new_subject()
+  process.send(sup_sub, supervisor.GetWorkerPool(req_pool))
+  let _pool = process.receive_forever(req_pool)
+
+  // Verify threat actor receives messages through supervised handle
+  let test_log =
+    SecurityLog(
+      source_ip: "192.168.1.200",
+      payload: "normal request",
+      prompt: None,
+      user_id: None,
+    )
+  let reply = process.new_subject()
+  process.send(threat_actor, actor.EnqueueEvent(test_log, reply))
+  let resp = process.receive_forever(reply)
+  resp.risk_level |> should.equal(LowRisk)
+}
+
+
+pub fn gameday_orchestrator_test() {
+  let scenarios = gameday.standard_scenarios()
+  let report = gameday.run_game_day(scenarios)
+
+  { report.total_scenarios >= 5 } |> should.equal(True)
+  { report.defensive_score >=. 80.0 } |> should.equal(True)
+  { report.mttd_ms >. 0.0 } |> should.equal(True)
+  { report.mttr_ms >. 0.0 } |> should.equal(True)
+}
+
+pub fn raft_consensus_state_machine_test() {
+  let assert Ok(node) = raft.start("node_1", ["node_2", "node_3"])
+
+  let status_req = process.new_subject()
+  process.send(node, raft.GetStatus(status_req))
+  let status = process.receive_forever(status_req)
+  status.node_id |> should.equal("node_1")
+  status.current_term |> should.equal(0)
+
+  // 1. Simulate Vote Request
+  let vote_req = process.new_subject()
+  process.send(node, raft.RequestVote(term: 1, candidate_id: "node_2", last_log_index: 0, last_log_term: 0, reply_to: vote_req))
+  let vote_resp = process.receive_forever(vote_req)
+  vote_resp.vote_granted |> should.equal(True)
+  vote_resp.term |> should.equal(1)
+
+  // 2. Simulate AppendEntries from Leader
+  let append_req = process.new_subject()
+  let entry = raft.LogEntry(index: 1, term: 1, command: "LOCKDOWN", data: "IP_BLOCK_1.1.1.1")
+  process.send(node, raft.AppendEntries(term: 1, leader_id: "node_2", prev_log_index: 0, prev_log_term: 0, entries: [entry], leader_commit: 1, reply_to: append_req))
+  let append_resp = process.receive_forever(append_req)
+  append_resp.success |> should.equal(True)
+  append_resp.match_index |> should.equal(1)
+}
+
+pub fn threat_hunter_campaign_correlation_test() {
+  let indicators = [
+    threat_hunter.ThreatIndicator(
+      source_ip: "198.51.100.99",
+      ttp: "T1190_EXPLOIT_PUBLIC_APP",
+      anomaly_weight: 0.9,
+      observed_endpoint: "/api/v1/auth",
+      timestamp: "2026-09-02T12:00:00Z",
+    ),
+    threat_hunter.ThreatIndicator(
+      source_ip: "198.51.100.99",
+      ttp: "T1059_EXECUTION_SHELL",
+      anomaly_weight: 0.95,
+      observed_endpoint: "/api/v1/admin/db_backup",
+      timestamp: "2026-09-02T12:05:00Z",
+    ),
+    threat_hunter.ThreatIndicator(
+      source_ip: "10.0.0.1",
+      ttp: "T0000_NORMAL",
+      anomaly_weight: 0.0,
+      observed_endpoint: "/api/v1/health",
+      timestamp: "2026-09-02T12:10:00Z",
+    ),
+  ]
+
+  let report = threat_hunter.correlate_events(indicators)
+  report.total_indicators_analyzed |> should.equal(3)
+  list.length(report.campaigns_discovered) |> should.equal(1)
+  { report.highest_threat_score >=. 80.0 } |> should.equal(True)
+  report.recommended_action |> should.equal("EXECUTE_AUTONOMOUS_CONTAINMENT")
+}
+
+pub fn secops_cli_command_parser_test() {
+  let cmd_help = cli.parse_command("help")
+  let resp_help = cli.execute_command(cmd_help)
+  resp_help.status |> should.equal("OK")
+
+  let cmd_status = cli.parse_command("status")
+  let resp_status = cli.execute_command(cmd_status)
+  resp_status.status |> should.equal("OK")
+
+  let cmd_quarantine = cli.parse_command("quarantine 198.51.100.55 APT Rootkit Attempt")
+  let resp_quar = cli.execute_command(cmd_quarantine)
+  resp_quar.status |> should.equal("OK")
+  string.contains(resp_quar.message, "198.51.100.55") |> should.equal(True)
+
+  let cmd_raft = cli.parse_command("raft status")
+  let resp_raft = cli.execute_command(cmd_raft)
+  resp_raft.status |> should.equal("OK")
+}
+
+pub fn deception_maze_honey_token_tripwire_test() {
+  let tokens = deception_maze.generate_standard_tokens()
+  list.length(tokens) |> should.equal(4)
+
+  // 1. Test accessing decoy AWS key
+  let trip_aws = deception_maze.evaluate_tripwire(tokens, "AKIAIOSFODNN7CANARYKEY", "198.51.100.77")
+  trip_aws.tripped |> should.equal(True)
+  trip_aws.token_id |> should.equal("HT-AWS-001")
+  trip_aws.token_type_name |> should.equal("DECOY_AWS_SECRET_KEY")
+  trip_aws.containment_action |> should.equal("CLUSTER_IMMEDIATE_QUARANTINE")
+
+  // 2. Test accessing decoy Canary Memory Pointer
+  let trip_mem = deception_maze.evaluate_tripwire(tokens, "0xdeadbeef_canary_0x9090", "198.51.100.77")
+  trip_mem.tripped |> should.equal(True)
+  trip_mem.token_id |> should.equal("HT-MEM-004")
+  trip_mem.token_type_name |> should.equal("CANARY_MEMORY_POINTER")
+
+  // 3. Test clean traffic
+  let trip_clean = deception_maze.evaluate_tripwire(tokens, "normal_safe_traffic", "10.0.0.1")
+  trip_clean.tripped |> should.equal(False)
+}
+
+pub fn autonomous_self_patcher_exploit_neutralization_test() {
+  let patch = self_patcher.synthesize_hot_patch("CVE-2024-3094", "xz_backdoor_payload")
+  patch.patch_id |> should.equal("PATCH-CVE_2024_3094")
+  patch.safety_verified |> should.equal(True)
+  string.contains(patch.bytecode_filter, "xz_backdoor_payload") |> should.equal(True)
+
+  let res = self_patcher.apply_patch(patch)
+  res.success |> should.equal(True)
+  res.zero_downtime |> should.equal(True)
+  res.neutralized_cve |> should.equal("CVE-2024-3094")
+}
+
 

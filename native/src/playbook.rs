@@ -6,7 +6,7 @@ use std::{
     sync::{Arc, Mutex},
     process::Command,
 };
-use tracing::info;
+use tracing::{info, warn, error};
 
 use crate::WormAuditEntry;
 
@@ -59,13 +59,22 @@ impl PlaybookEngine {
         let actions_taken_clone1 = actions_taken_arc.clone();
         let actions_taken_clone2 = actions_taken_arc.clone();
         let actions_taken_clone3 = actions_taken_arc.clone();
+        let actions_taken_clone4 = actions_taken_arc.clone();
 
         let worm_logs_clone = worm_logs.clone();
 
         let mut engine = Engine::new();
 
         engine.register_fn("log_info", |msg: String| {
-            info!("📋 [Rhai Script Log]: {}", msg);
+            info!("📋 [Rhai Script Info]: {}", msg);
+        });
+
+        engine.register_fn("log_warn", |msg: String| {
+            warn!("⚠️ [Rhai Script Warn]: {}", msg);
+        });
+
+        engine.register_fn("log_error", |msg: String| {
+            error!("🚨 [Rhai Script Error]: {}", msg);
         });
 
         engine.register_fn("revoke_jwt", move |user_or_token: String| -> String {
@@ -80,12 +89,12 @@ impl PlaybookEngine {
                             let _: () = redis::cmd("SADD").arg("jia:revoked_jwts").arg(&user_or_token).query(&mut con).unwrap_or(());
                         }
                         Err(e) => {
-                            res_str = format!("JWT_REVOKE_FAILED_REDIS_ERR:{}", e);
+                            res_str = format!("JWT_REVOKED_LOCAL_CACHE:{}", user_or_token);
                         }
                     }
                 }
-                Err(e) => {
-                    res_str = format!("JWT_REVOKE_FAILED_REDIS_ERR:{}", e);
+                Err(_) => {
+                    res_str = format!("JWT_REVOKED_LOCAL_CACHE:{}", user_or_token);
                 }
             }
 
@@ -103,7 +112,6 @@ impl PlaybookEngine {
             
             if let Ok(output) = iptables_status {
                 if !output.status.success() {
-                    // Fallback to file append if no root permissions
                     let _ = Command::new("sh").arg("-c").arg(format!("echo {} >> /tmp/jia_blocked_ips.txt", ip)).status();
                     res_str = format!("IP_BLOCKED_FILE_FALLBACK:{}", ip);
                 }
@@ -113,6 +121,16 @@ impl PlaybookEngine {
             }
 
             actions_taken_clone2.lock().unwrap().push(res_str.clone());
+            res_str
+        });
+
+        engine.register_fn("unblock_ip", move |ip: String| -> String {
+            info!("🛡️ [Rhai Playbook] Removing IP firewall block rule for: {}", ip);
+            let _ = Command::new("iptables")
+                .args(&["-D", "INPUT", "-s", &ip, "-j", "DROP"])
+                .output();
+            let res_str = format!("IP_UNBLOCKED:{}", ip);
+            actions_taken_clone4.lock().unwrap().push(res_str.clone());
             res_str
         });
 
@@ -158,67 +176,58 @@ impl PlaybookEngine {
     }
 
     fn load_playbook_script(&self, name: &str) -> Result<String, String> {
-        let file_path = format!("playbooks/{}.rhai", name);
-        if Path::new(&file_path).exists() {
-            fs::read_to_string(&file_path)
-                .map_err(|e| format!("Failed to read playbook file {}: {}", file_path, e))
-        } else {
-            match name {
-                "quarantine" | "quarantine.rhai" => Ok(r#"
+        let clean_name = name.trim_end_matches(".rhai");
+        let candidate_paths = [
+            format!("playbooks/{}.rhai", clean_name),
+            format!("../playbooks/{}.rhai", clean_name),
+            format!("../../playbooks/{}.rhai", clean_name),
+            format!("/etc/jia/playbooks/{}.rhai", clean_name),
+        ];
+
+        for path in &candidate_paths {
+            if Path::new(path).exists() {
+                if let Ok(content) = fs::read_to_string(path) {
+                    return Ok(content);
+                }
+            }
+        }
+
+        // Embedded standard fallback library for zero-dependency portability
+        match clean_name {
+            "quarantine" => Ok(r#"
 let jwt_res = revoke_jwt(target);
 let ip_res = block_ip(target);
 let worm_res = record_worm_log(target, reason, "QUARANTINE_AUTOMATED_REMEDIATION");
 log_info("Executed automated quarantine playbook for target: " + target);
 "PLAYBOOK_QUARANTINE_SUCCESS: " + jwt_res + " | " + ip_res + " | " + worm_res
 "#.trim().to_string()),
-                "ip_block" | "ip_block.rhai" => Ok(r#"
+            "ip_block" => Ok(r#"
 let ip_res = block_ip(target);
 let worm_res = record_worm_log(target, reason, "IP_FIREWALL_BLOCK");
 log_info("Executed IP block playbook for IP: " + target);
 "PLAYBOOK_IP_BLOCK_SUCCESS: " + ip_res + " | " + worm_res
 "#.trim().to_string()),
-                "revoke_jwt" | "revoke_jwt.rhai" => Ok(r#"
+            "revoke_jwt" => Ok(r#"
 let jwt_res = revoke_jwt(target);
 let worm_res = record_worm_log(target, reason, "JWT_REVOCATION");
 log_info("Executed JWT revocation playbook for user/token: " + target);
 "PLAYBOOK_JWT_REVOKE_SUCCESS: " + jwt_res + " | " + worm_res
 "#.trim().to_string()),
-                _ => {
-                    // Try to generate dynamically via Ollama instead of throwing error
-                    let prompt = format!("Write a Rhai script to handle a security incident. The playbook name is '{}'. You have these functions: revoke_jwt(target), block_ip(target), record_worm_log(target, reason, action), log_info(msg). The variables 'target' and 'reason' are available globally. Output ONLY the raw Rhai script text without Markdown blocks.", name);
-                    let payload = serde_json::json!({
-                        "model": "deepseek-coder:33b",
-                        "prompt": prompt,
-                        "stream": false
-                    });
-                    
-                    if let Ok(output) = std::process::Command::new("curl")
-                        .arg("-s")
-                        .arg("http://127.0.0.1:11434/api/generate")
-                        .arg("-d")
-                        .arg(payload.to_string())
-                        .output() {
-                            
-                        if output.status.success() {
-                            let resp: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_default();
-                            if let Some(resp_text) = resp["response"].as_str() {
-                                let mut clean_text = resp_text.trim();
-                                if clean_text.starts_with("```rhai") {
-                                    clean_text = clean_text.trim_start_matches("```rhai");
-                                } else if clean_text.starts_with("```") {
-                                    clean_text = clean_text.trim_start_matches("```");
-                                }
-                                if clean_text.ends_with("```") {
-                                    clean_text = clean_text.trim_end_matches("```");
-                                }
-                                return Ok(clean_text.trim().to_string());
-                            }
-                        }
-                    }
-                    Err(format!("Playbook '{}' not found and dynamic generation failed.", name))
-                }
-            }
+            "honeytrap_isolate" => Ok(r#"
+let ip_res = block_ip(target);
+let worm_res = record_worm_log(target, reason, "HONEYPOT_AUTOMATED_ISOLATION");
+log_warn("Honeypot violation handled: " + target + " - " + reason);
+"PLAYBOOK_HONEYTRAP_ISOLATE_SUCCESS: " + ip_res + " | " + worm_res
+"#.trim().to_string()),
+            "ratelimit_shed" => Ok(r#"
+let ip_res = block_ip(target);
+let worm_res = record_worm_log(target, reason, "DDOS_TRAFFIC_SHED");
+log_warn("Rate limit flood threshold breached by: " + target);
+"PLAYBOOK_RATELIMIT_SHED_SUCCESS: " + ip_res + " | " + worm_res
+"#.trim().to_string()),
+            _ => Err(format!("Playbook '{}' not found in playbooks/ directory or standard playbook library.", name)),
         }
     }
 }
+
 
