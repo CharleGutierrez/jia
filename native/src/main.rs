@@ -292,7 +292,12 @@ async fn main() {
         .route("/api/v1/copilot/query", post(copilot_query_handler))
         .route("/api/v1/ollama/status", get(ollama_status_handler))
         .route("/api/v1/ollama/generate_playbook", post(ollama_generate_playbook_handler))
+
+        .route("/api/v1/ollama/triage", post(ollama_triage_handler))
+        .route("/api/v1/ollama/forensic_chat", post(ollama_forensic_chat_handler))
+        .route("/api/v1/ollama/lifecycle", post(ollama_lifecycle_handler))
         // Honeypot Decoy Routes
+
 
         .route("/api/v1/admin/db_backup", post(honeypot::honeypot_handler).get(honeypot::honeypot_handler))
         .route("/config/env", post(honeypot::honeypot_handler).get(honeypot::honeypot_handler))
@@ -1220,6 +1225,28 @@ async fn ollama_generate_playbook_handler(
     let status = if resp.success { StatusCode::OK } else { StatusCode::BAD_REQUEST };
     (status, Json(resp))
 }
+
+async fn ollama_triage_handler(
+    Json(payload): Json<ollama_adapter::ThreatTriageRequest>,
+) -> impl IntoResponse {
+    let resp = ollama_adapter::OllamaAdapter::perform_triage(&payload);
+    (StatusCode::OK, Json(resp))
+}
+
+async fn ollama_forensic_chat_handler(
+    Json(payload): Json<ollama_adapter::ForensicChatRequest>,
+) -> impl IntoResponse {
+    let resp = ollama_adapter::OllamaAdapter::forensic_chat(&payload);
+    (StatusCode::OK, Json(resp))
+}
+
+async fn ollama_lifecycle_handler(
+    Json(payload): Json<ollama_adapter::ModelLifecycleRequest>,
+) -> impl IntoResponse {
+    let resp = ollama_adapter::OllamaAdapter::manage_lifecycle(&payload);
+    (StatusCode::OK, Json(resp))
+}
+
 
 
 
