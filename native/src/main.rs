@@ -36,10 +36,13 @@ pub mod ebpf_xdp;
 pub mod evidence_bag;
 pub mod firewall;
 pub mod honeypot;
+pub mod llm_safety_gate;
 pub mod merkle_worm;
 pub mod microseg;
 pub mod mpc_keys;
+pub mod ollama_adapter;
 pub mod playbook;
+
 pub mod pqc;
 pub mod pq_mesh_vpn;
 pub mod rag_agent;
@@ -287,7 +290,10 @@ async fn main() {
         .route("/api/v1/tpm/attest", post(tpm_attest_handler))
         .route("/api/v1/vpn/status", get(vpn_status_handler))
         .route("/api/v1/copilot/query", post(copilot_query_handler))
+        .route("/api/v1/ollama/status", get(ollama_status_handler))
+        .route("/api/v1/ollama/generate_playbook", post(ollama_generate_playbook_handler))
         // Honeypot Decoy Routes
+
         .route("/api/v1/admin/db_backup", post(honeypot::honeypot_handler).get(honeypot::honeypot_handler))
         .route("/config/env", post(honeypot::honeypot_handler).get(honeypot::honeypot_handler))
         .route("/root/ssh_keys", post(honeypot::honeypot_handler).get(honeypot::honeypot_handler))
@@ -1202,6 +1208,19 @@ async fn copilot_query_handler(
     let resp = copilot::SecOpsCopilot::process_query(&payload.prompt);
     (StatusCode::OK, Json(resp))
 }
+
+async fn ollama_status_handler() -> impl IntoResponse {
+    (StatusCode::OK, Json(ollama_adapter::OllamaAdapter::get_status()))
+}
+
+async fn ollama_generate_playbook_handler(
+    Json(payload): Json<ollama_adapter::GeneratePlaybookRequest>,
+) -> impl IntoResponse {
+    let resp = ollama_adapter::OllamaAdapter::synthesize_playbook(&payload);
+    let status = if resp.success { StatusCode::OK } else { StatusCode::BAD_REQUEST };
+    (status, Json(resp))
+}
+
 
 
 

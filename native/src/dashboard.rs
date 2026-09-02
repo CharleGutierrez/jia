@@ -509,8 +509,8 @@ detection:
             <div style="margin-top: 14px;" class="output-box" id="vpn-output">Quantum-safe peer tunnels and byte counters will appear here...</div>
         </div>
 
-        <!-- Natural Language SecOps Copilot -->
-        <div class="glass-card col-12">
+        <!-- Natural Language SecOps AI Copilot -->
+        <div class="glass-card col-6">
             <div class="card-header">
                 <h3>🤖 Natural Language SecOps AI Copilot</h3>
                 <span class="mono" style="font-size: 0.75rem; color: var(--neon-cyan);">Conversational IR Assistant</span>
@@ -519,7 +519,24 @@ detection:
             <button onclick="querySecOpsCopilot()">Send Instruction to SecOps Copilot</button>
             <div style="margin-top: 14px;" class="output-box" id="copilot-output">Copilot reasoning and autonomous containment actions will appear here...</div>
         </div>
+
+        <!-- Local Ollama Air-Gapped Cognitive AI & Safety Gate -->
+        <div class="glass-card col-6">
+            <div class="card-header">
+                <h3>🧠 Local Air-Gapped Ollama SLM & Safety Gate</h3>
+                <span class="mono" style="font-size: 0.75rem; color: var(--neon-purple);">VRAM Cap: <1.5GB | nomic + qwen</span>
+            </div>
+            <input type="text" id="ollama-threat" placeholder="Threat description..." value="Zero-Day Remote Code Execution via unauthenticated memory injection">
+            <input type="text" id="ollama-target-ip" placeholder="Target adversary IP..." value="198.51.100.99" style="margin-top: 6px;">
+            <div style="display: flex; gap: 8px; margin-top: 8px;">
+                <button onclick="fetchOllamaStatus()" style="width: 50%;">Model Status</button>
+                <button onclick="generateSafePlaybook()" style="width: 50%;">Synthesize Playbook</button>
+            </div>
+            <div style="margin-top: 14px;" class="output-box" id="ollama-output">Local LLM status, VRAM telemetry, and verified Rhai playbooks will appear here...</div>
+        </div>
     </div>
+
+
 
 
 
@@ -766,16 +783,28 @@ detection:
             document.getElementById('vpn-output').textContent = JSON.stringify(data, null, 2);
         }
 
-        async function querySecOpsCopilot() {
-            const prompt = document.getElementById('copilot-input').value;
-            const resp = await fetch('/api/v1/copilot/query', {
+        async function fetchOllamaStatus() {
+            const resp = await fetch('/api/v1/ollama/status');
+            const data = await resp.json();
+            document.getElementById('ollama-output').textContent = JSON.stringify(data, null, 2);
+        }
+
+        async function generateSafePlaybook() {
+            const threat = document.getElementById('ollama-threat').value;
+            const ip = document.getElementById('ollama-target-ip').value;
+            const resp = await fetch('/api/v1/ollama/generate_playbook', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ prompt: prompt })
+                body: JSON.stringify({
+                    threat_description: threat,
+                    target_ip: ip,
+                    cve_id: "CVE-2026-ZERO-DAY"
+                })
             });
             const data = await resp.json();
-            document.getElementById('copilot-output').textContent = JSON.stringify(data, null, 2);
+            document.getElementById('ollama-output').textContent = JSON.stringify(data, null, 2);
         }
+
 
 
 

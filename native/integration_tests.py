@@ -353,12 +353,48 @@ detection:
         assert copilot_data.get("executed_containment") == True
         print("   ✓ SecOps Copilot parsed natural language intent and executed automated containment!")
 
+        # 28. Ollama Runtime Status & VRAM Allocation Cap Verification
+        print("28. Testing Local Ollama Status & VRAM Budget Verification...")
+        status, ollama_data = request(f"{base_url}/ollama/status", method="GET")
+        assert status == 200
+        assert ollama_data.get("vram_cap_mb") <= 1536
+        assert len(ollama_data.get("models", [])) == 2
+        print(f"   ✓ Local Ollama VRAM allocation strictly capped at {ollama_data.get('vram_cap_mb')}MB (under 1.5GB budget)!")
+
+        # 29. Anti-Hallucination Safety Gate & Safe Rhai Playbook Synthesis
+        print("29. Testing Anti-Hallucination Safety Gate & Safe Playbook Synthesis...")
+        status, play_data = request(f"{base_url}/ollama/generate_playbook", {
+            "threat_description": "SSH Brute Force Attack with Rootkit attempt",
+            "target_ip": "198.51.100.99",
+            "cve_id": "CVE-2024-3094"
+        })
+        assert status == 200
+        assert play_data.get("success") == True
+        assert play_data.get("zero_data_exfiltration") == True
+        assert play_data.get("safety_validation", {}).get("safe_to_execute") == True
+        assert "ebpf_block_ip" in play_data.get("synthesized_rhai_playbook", "")
+        print(f"   ✓ Rhai SOAR Playbook synthesized in {play_data.get('generation_latency_ms', 0):.2f}ms with 100% safety AST approval!")
+
+        # 30. Protected Infrastructure IP Quarantine Rejection Guardrail
+        print("30. Testing Anti-Hallucination Protected IP Guardrail (127.0.0.1 Protection)...")
+        status, bad_play_data = request(f"{base_url}/ollama/generate_playbook", {
+            "threat_description": "Simulated Hallucinated Threat targeting localhost",
+            "target_ip": "127.0.0.1",
+            "cve_id": "CVE-HALLUCINATED"
+        })
+        assert status == 400
+        assert bad_play_data.get("success") == False
+        assert bad_play_data.get("safety_validation", {}).get("safe_to_execute") == False
+        assert any("protected infrastructure IP" in r for r in bad_play_data.get("safety_validation", {}).get("violation_reasons", []))
+        print("   ✓ Safety gate successfully intercepted and rejected attempt to quarantine 127.0.0.1!")
+
         print("\n=======================================================")
-        print("🎉 ALL 27 END-TO-END SECURITY INTEGRATION TESTS PASSED!")
+        print("🎉 ALL 30 END-TO-END SECURITY INTEGRATION TESTS PASSED!")
         print("=======================================================")
     finally:
         server.terminate()
         server.wait()
+
 
 
 

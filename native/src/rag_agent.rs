@@ -310,33 +310,11 @@ impl RagEngine {
         }
     }
 
-    /// Fetches a real dense vector embedding securely using reqwest (blocking)
+    /// Fetches a real dense vector embedding securely using OllamaAdapter
     fn fetch_embedding(text: &str) -> Result<Vec<f32>, String> {
-        let payload = serde_json::json!({
-            "model": "nomic-embed-text",
-            "prompt": text
-        });
-
-        let client = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_millis(800))
-            .build()
-            .map_err(|e| e.to_string())?;
-
-        let resp = client.post("http://127.0.0.1:11434/api/embeddings")
-            .json(&payload)
-            .send()
-            .map_err(|e| e.to_string())?;
-            
-        if resp.status().is_success() {
-            let json: serde_json::Value = resp.json().map_err(|e| e.to_string())?;
-            if let Some(arr) = json["embedding"].as_array() {
-                let vec: Vec<f32> = arr.iter().filter_map(|v| v.as_f64().map(|f| f as f32)).collect();
-                return Ok(vec);
-            }
-        }
-        
-        Err("Failed to parse embedding response".into())
+        crate::ollama_adapter::OllamaAdapter::fetch_embedding(text)
     }
+
 
     /// Computes actual cosine similarity between two dense vectors
     fn dense_cosine_similarity(vec1: &[f32], vec2: &[f32]) -> f32 {

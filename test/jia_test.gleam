@@ -30,6 +30,8 @@ import jia/threat_hunter
 import jia/cli
 import jia/deception_maze
 import jia/self_patcher
+import jia/ollama_agent
+
 
 
 
@@ -545,5 +547,24 @@ pub fn autonomous_self_patcher_exploit_neutralization_test() {
   res.zero_downtime |> should.equal(True)
   res.neutralized_cve |> should.equal("CVE-2024-3094")
 }
+
+pub fn ollama_agent_cognitive_job_test() {
+  let job =
+    ollama_agent.create_job(
+      "JOB-001",
+      "Lateral movement ptrace injection detected",
+      "198.51.100.99",
+      ollama_agent.HighPriority,
+    )
+  job.job_id |> should.equal("JOB-001")
+  job.source_ip |> should.equal("198.51.100.99")
+
+  let result = ollama_agent.evaluate_cognitive_job(job)
+  result.success |> should.equal(True)
+  result.containment_suggested |> should.equal(True)
+  result.zero_data_exfiltration |> should.equal(True)
+  string.contains(result.synthesized_playbook, "ebpf_block_ip") |> should.equal(True)
+}
+
 
 
